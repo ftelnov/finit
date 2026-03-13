@@ -1,0 +1,21 @@
+# Go
+orchestrator/finit-orchestrator
+orchestrator/tmp/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Docker
+docker-compose.override.yml

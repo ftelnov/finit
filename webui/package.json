@@ -1,0 +1,14 @@
+{
+  "name": "finit-webui",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "ioredis": "^5.4.0",
+    "ws": "^8.18.0"
+  }
+}

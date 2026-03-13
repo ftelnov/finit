@@ -1,0 +1,129 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mock-llm:
+    build:
+      context: ./mock-llm
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  orchestrator:
+    build:
+      context: ./orchestrator
+    ports:
+      - "8080:8080"
+    environment:
+      - REDIS_URL=redis:6379
+      - PORT=8080
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  agent-router:
+    build:
+      context: ./agents
+    environment:
+      - AGENT_TYPE=router
+      - REDIS_URL=redis://redis:6379/0
+      - ZAI_API_KEY=${ZAI_API_KEY:-mock}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://mock-llm:8000/v1/}
+      - LLM_MODEL=${LLM_MODEL:-mock-llm}
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-llm:
+        condition: service_healthy
+
+  agent-spec:
+    build:
+      context: ./agents
+    environment:
+      - AGENT_TYPE=spec
+      - REDIS_URL=redis://redis:6379/0
+      - ZAI_API_KEY=${ZAI_API_KEY:-mock}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://mock-llm:8000/v1/}
+      - LLM_MODEL=${LLM_MODEL:-mock-llm}
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-llm:
+        condition: service_healthy
+
+  agent-developer:
+    build:
+      context: ./agents
+    environment:
+      - AGENT_TYPE=developer
+      - REDIS_URL=redis://redis:6379/0
+      - ZAI_API_KEY=${ZAI_API_KEY:-mock}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://mock-llm:8000/v1/}
+      - LLM_MODEL=${LLM_MODEL:-mock-llm}
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-llm:
+        condition: service_healthy
+
+  agent-reviewer:
+    build:
+      context: ./agents
+    environment:
+      - AGENT_TYPE=reviewer
+      - REDIS_URL=redis://redis:6379/0
+      - ZAI_API_KEY=${ZAI_API_KEY:-mock}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://mock-llm:8000/v1/}
+      - LLM_MODEL=${LLM_MODEL:-mock-llm}
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-llm:
+        condition: service_healthy
+
+  webui:
+    build:
+      context: ./webui
+    ports:
+      - "3000:3000"
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:8080
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+
+  e2e-tests:
+    build:
+      context: ./tests/e2e
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:8080
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+      agent-router:
+        condition: service_started
+      agent-spec:
+        condition: service_started
+      agent-developer:
+        condition: service_started
+      agent-reviewer:
+        condition: service_started
+    profiles:
+      - test

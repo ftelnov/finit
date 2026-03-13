@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Finit - Agent Pipeline Observer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+      background: #0a0a0f;
+      color: #c8c8d0;
+      min-height: 100vh;
+    }
+
+    header {
+      background: #12121a;
+      border-bottom: 1px solid #2a2a3a;
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    header h1 {
+      font-size: 18px;
+      color: #e0e0ff;
+      font-weight: 600;
+    }
+
+    header h1 span { color: #7c6cf0; }
+
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 8px;
+    }
+    .status-dot.connected { background: #4caf50; box-shadow: 0 0 6px #4caf50; }
+    .status-dot.disconnected { background: #f44336; }
+
+    .controls {
+      padding: 16px 24px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+
+    input[type="text"] {
+      flex: 1;
+      background: #16161f;
+      border: 1px solid #2a2a3a;
+      color: #e0e0ff;
+      padding: 10px 16px;
+      border-radius: 6px;
+      font-family: inherit;
+      font-size: 14px;
+    }
+
+    input[type="text"]:focus {
+      outline: none;
+      border-color: #7c6cf0;
+    }
+
+    button {
+      background: #7c6cf0;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: inherit;
+      font-weight: 600;
+      font-size: 14px;
+    }
+    button:hover { background: #6b5ce0; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .main {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      padding: 0 24px 24px;
+      height: calc(100vh - 140px);
+    }
+
+    .panel {
+      background: #12121a;
+      border: 1px solid #2a2a3a;
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .panel-header {
+      padding: 12px 16px;
+      border-bottom: 1px solid #2a2a3a;
+      font-size: 13px;
+      font-weight: 600;
+      color: #8888a0;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    .panel-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+    }
+
+    /* Pipeline mindmap */
+    .pipeline {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 16px;
+    }
+
+    .pipeline-stage {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 14px;
+      background: #16161f;
+      border-radius: 6px;
+      border-left: 3px solid #2a2a3a;
+      transition: all 0.3s;
+    }
+
+    .pipeline-stage.active {
+      border-left-color: #7c6cf0;
+      background: #1a1a2e;
+    }
+
+    .pipeline-stage.completed {
+      border-left-color: #4caf50;
+    }
+
+    .pipeline-stage .icon {
+      font-size: 18px;
+      width: 24px;
+      text-align: center;
+    }
+
+    .pipeline-stage .label {
+      font-size: 13px;
+      color: #a0a0b8;
+    }
+
+    .pipeline-stage .count {
+      margin-left: auto;
+      background: #2a2a3a;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      color: #7c6cf0;
+    }
+
+    .pipeline-connector {
+      width: 2px;
+      height: 12px;
+      background: #2a2a3a;
+      margin-left: 30px;
+    }
+
+    /* Events log */
+    .event {
+      padding: 8px 12px;
+      border-bottom: 1px solid #1a1a24;
+      font-size: 12px;
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+    }
+
+    .event:hover { background: #16161f; }
+
+    .event .time {
+      color: #555568;
+      white-space: nowrap;
+      min-width: 80px;
+    }
+
+    .event .stream-tag {
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .stream-routing { background: #2d1f5e; color: #b39dff; }
+    .stream-spec { background: #1f3d5e; color: #9dd5ff; }
+    .stream-dev { background: #1f5e2d; color: #9dffb3; }
+    .stream-review { background: #5e4a1f; color: #ffd89d; }
+
+    .event .msg {
+      color: #c8c8d0;
+      word-break: break-all;
+    }
+
+    /* Task detail */
+    .task-item {
+      padding: 10px 14px;
+      border-bottom: 1px solid #1a1a24;
+      cursor: pointer;
+    }
+
+    .task-item:hover { background: #16161f; }
+
+    .task-item .task-id {
+      font-size: 11px;
+      color: #555568;
+    }
+
+    .task-item .task-input {
+      font-size: 13px;
+      color: #c8c8d0;
+      margin-top: 4px;
+    }
+
+    .task-item .task-status {
+      display: inline-block;
+      margin-top: 4px;
+      padding: 2px 8px;
+      border-radius: 3px;
+      font-size: 11px;
+    }
+
+    .status-created { background: #2a2a3a; color: #888; }
+    .status-routed { background: #2d1f5e; color: #b39dff; }
+    .status-specced { background: #1f3d5e; color: #9dd5ff; }
+    .status-developed { background: #1f5e2d; color: #9dffb3; }
+    .status-completed { background: #1a4a1a; color: #4caf50; }
+
+    .detail-json {
+      background: #0d0d14;
+      border-radius: 4px;
+      padding: 12px;
+      font-size: 12px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      color: #9d9db8;
+      margin-top: 8px;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+
+    @media (max-width: 900px) {
+      .main { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1><span>finit</span> pipeline observer</h1>
+    <div id="conn-status"><span class="status-dot disconnected"></span> connecting...</div>
+  </header>
+
+  <div class="controls">
+    <input type="text" id="task-input" placeholder="Describe a task... e.g., 'Add a /healthz endpoint to Go service'" />
+    <button id="submit-btn" onclick="submitTask()">Submit Task</button>
+  </div>
+
+  <div class="main">
+    <!-- Left: Pipeline visualization + Tasks -->
+    <div style="display: flex; flex-direction: column; gap: 16px;">
+      <div class="panel" style="flex: 0 0 auto;">
+        <div class="panel-header">Agent Pipeline</div>
+        <div class="panel-body">
+          <div class="pipeline" id="pipeline">
+            <div class="pipeline-stage" data-stage="routing">
+              <div class="icon">&#x1F9ED;</div>
+              <div class="label">Router Agent</div>
+              <div class="count" id="count-routing">0</div>
+            </div>
+            <div class="pipeline-connector"></div>
+            <div class="pipeline-stage" data-stage="spec">
+              <div class="icon">&#x1F4CB;</div>
+              <div class="label">Spec Generator</div>
+              <div class="count" id="count-spec">0</div>
+            </div>
+            <div class="pipeline-connector"></div>
+            <div class="pipeline-stage" data-stage="dev">
+              <div class="icon">&#x1F4BB;</div>
+              <div class="label">Developer Agent</div>
+              <div class="count" id="count-dev">0</div>
+            </div>
+            <div class="pipeline-connector"></div>
+            <div class="pipeline-stage" data-stage="review">
+              <div class="icon">&#x1F50D;</div>
+              <div class="label">Review Agent</div>
+              <div class="count" id="count-review">0</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" style="flex: 1;">
+        <div class="panel-header">Tasks</div>
+        <div class="panel-body" id="tasks-list">
+          <div style="padding: 20px; color: #555; text-align: center;">No tasks yet</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right: Event stream + Detail -->
+    <div style="display: flex; flex-direction: column; gap: 16px;">
+      <div class="panel" style="flex: 1;">
+        <div class="panel-header">Event Stream</div>
+        <div class="panel-body" id="events-log"></div>
+      </div>
+
+      <div class="panel" style="flex: 1;">
+        <div class="panel-header">Task Detail</div>
+        <div class="panel-body" id="task-detail">
+          <div style="padding: 20px; color: #555; text-align: center;">Click a task to inspect</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let ws;
+    let tasks = {};
+    const stageCounts = { routing: 0, spec: 0, dev: 0, review: 0 };
+
+    function connect() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${proto}//${location.host}`);
+
+      ws.onopen = () => {
+        document.getElementById('conn-status').innerHTML =
+          '<span class="status-dot connected"></span> connected';
+      };
+
+      ws.onclose = () => {
+        document.getElementById('conn-status').innerHTML =
+          '<span class="status-dot disconnected"></span> reconnecting...';
+        setTimeout(connect, 2000);
+      };
+
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'stream_event') {
+          handleStreamEvent(msg);
+        }
+      };
+    }
+
+    function handleStreamEvent(evt) {
+      // Update stage counts
+      const streamMap = {
+        'tasks:pending_routing': 'routing',
+        'tasks:routed': 'routing',
+        'tasks:pending_spec': 'spec',
+        'tasks:specced': 'spec',
+        'tasks:pending_dev': 'dev',
+        'tasks:developed': 'dev',
+        'tasks:pending_review': 'review',
+        'tasks:reviewed': 'review',
+      };
+
+      const stage = streamMap[evt.stream];
+      if (stage) {
+        stageCounts[stage]++;
+        document.getElementById(`count-${stage}`).textContent = stageCounts[stage];
+
+        // Highlight active stage
+        document.querySelectorAll('.pipeline-stage').forEach(el => {
+          el.classList.remove('active');
+        });
+        const activeStage = document.querySelector(`[data-stage="${stage}"]`);
+        if (activeStage) activeStage.classList.add('active');
+      }
+
+      // Mark completed stages
+      if (evt.stream === 'tasks:reviewed') {
+        document.querySelectorAll('.pipeline-stage').forEach(el => {
+          el.classList.add('completed');
+        });
+      }
+
+      // Add event to log
+      addEvent(evt);
+
+      // Update task in memory
+      if (evt.data && evt.data.id) {
+        tasks[evt.data.id] = evt.data;
+        renderTasks();
+      }
+    }
+
+    function addEvent(evt) {
+      const log = document.getElementById('events-log');
+      const div = document.createElement('div');
+      div.className = 'event';
+
+      const streamShort = evt.stream.replace('tasks:', '');
+      let tagClass = 'stream-routing';
+      if (streamShort.includes('spec')) tagClass = 'stream-spec';
+      if (streamShort.includes('dev')) tagClass = 'stream-dev';
+      if (streamShort.includes('review')) tagClass = 'stream-review';
+
+      const time = new Date(evt.timestamp).toLocaleTimeString();
+
+      div.innerHTML = `
+        <span class="time">${time}</span>
+        <span class="stream-tag ${tagClass}">${streamShort}</span>
+        <span class="msg">${evt.taskId} &rarr; ${evt.taskStatus}</span>
+      `;
+
+      log.insertBefore(div, log.firstChild);
+
+      // Keep max 200 events
+      while (log.children.length > 200) {
+        log.removeChild(log.lastChild);
+      }
+    }
+
+    function renderTasks() {
+      const list = document.getElementById('tasks-list');
+      const taskIds = Object.keys(tasks).sort().reverse();
+
+      if (taskIds.length === 0) return;
+
+      list.innerHTML = taskIds.map(id => {
+        const t = tasks[id];
+        return `
+          <div class="task-item" onclick="showDetail('${id}')">
+            <div class="task-id">${id}</div>
+            <div class="task-input">${(t.input || '').substring(0, 80)}</div>
+            <span class="task-status status-${t.status || 'created'}">${t.status || 'created'}</span>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function showDetail(id) {
+      const t = tasks[id];
+      if (!t) return;
+
+      const detail = document.getElementById('task-detail');
+      detail.innerHTML = `
+        <div style="padding: 12px;">
+          <div style="font-size: 14px; color: #e0e0ff; margin-bottom: 8px;">${t.input || 'N/A'}</div>
+          <div style="font-size: 12px; color: #7c6cf0; margin-bottom: 12px;">
+            Status: ${t.status} | Domains: ${(t.domains || []).join(', ') || 'pending'}
+          </div>
+          ${t.spec ? `<div style="font-size: 11px; color: #888; margin-bottom: 4px;">SPEC</div><div class="detail-json">${JSON.stringify(t.spec, null, 2)}</div>` : ''}
+          ${t.code ? `<div style="font-size: 11px; color: #888; margin-top: 12px; margin-bottom: 4px;">CODE</div><div class="detail-json">${JSON.stringify(t.code, null, 2)}</div>` : ''}
+          ${t.review ? `<div style="font-size: 11px; color: #888; margin-top: 12px; margin-bottom: 4px;">REVIEW</div><div class="detail-json">${JSON.stringify(t.review, null, 2)}</div>` : ''}
+        </div>
+      `;
+    }
+
+    async function submitTask() {
+      const input = document.getElementById('task-input');
+      const btn = document.getElementById('submit-btn');
+      const text = input.value.trim();
+      if (!text) return;
+
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/tasks', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ input: text }),
+        });
+        const data = await res.json();
+        if (data.id) {
+          tasks[data.id] = data;
+          renderTasks();
+          input.value = '';
+
+          // Start polling this task
+          pollTask(data.id);
+        }
+      } catch (err) {
+        console.error('Submit error:', err);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function pollTask(id) {
+      for (let i = 0; i < 100; i++) {
+        await new Promise(r => setTimeout(r, 3000));
+        try {
+          const res = await fetch(`/api/task?id=${id}`);
+          const data = await res.json();
+          tasks[id] = data;
+          renderTasks();
+          if (data.status === 'completed') break;
+        } catch (e) {}
+      }
+    }
+
+    // Enter key to submit
+    document.getElementById('task-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitTask();
+    });
+
+    // Load existing tasks on page load
+    async function loadTasks() {
+      try {
+        const res = await fetch('/api/tasks');
+        const data = await res.json();
+        data.forEach(t => { tasks[t.id] = t; });
+        renderTasks();
+      } catch (e) {}
+    }
+
+    connect();
+    loadTasks();
+  </script>
+</body>
+</html>
