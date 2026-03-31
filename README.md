@@ -1,8 +1,14 @@
-# Finit - Environment-Aware Autonomous Development Agent
+# Finit
 
-## Что такое Finit?
+### From intent to finished.
 
-Finit - это система разработки в режиме **Polished YOLO**. Агент берет задачу по software engineering, самостоятельно готовит окружение и инструментарий, выполняет задачу автономно в песочнице и выдает отревьюенный результат. Пользователь взаимодействует только на определенных чекпоинтах: согласование спецификации и выдача разрешений.
+---
+
+Finit bridges the gap between human intent and autonomous execution in software development. You describe what you want — the system handles environment, tooling, coordination, review — and only asks when it genuinely cannot proceed.
+
+Today's AI coding agents treat their environment as someone else's problem. They break when a tool is missing, a runtime is wrong, or a dependency isn't configured. The developer becomes the agent's babysitter — debugging environments so the agent can do simple work.
+
+Finit inverts this. Agents own their environment. They analyze tasks before attempting them, identify capability gaps, acquire what's missing, coordinate with each other through shared knowledge, and deliver reviewed results. The developer steers with intent, not with manual labor.
 
 ### Проблема
 
