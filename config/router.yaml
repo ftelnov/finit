@@ -1,0 +1,34 @@
+listen: ":8081"
+
+providers:
+  - name: mock
+    url: "http://mock-llm:8000/v1"
+    weight: 1
+    models:
+      mock-llm:
+        pricing: { input_per_1m: 0.0, output_per_1m: 0.0 }
+
+balancing:
+  strategy: "latency-based"
+  health_aware: true
+
+circuit_breaker:
+  failure_threshold: 3
+  failure_window_s: 30
+  cooldown_s: 30
+
+guardrails:
+  prompt_injection: true
+  secret_scan: true
+
+budget:
+  default_max_tokens: 500000
+  default_max_calls: 50
+
+mlflow:
+  tracking_uri: "http://mlflow:5000"
+  experiment_name: "finit-llm"
+  log_prompts: false
+
+telemetry:
+  otlp_endpoint: "otel-collector:4317"

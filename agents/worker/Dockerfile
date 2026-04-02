@@ -1,0 +1,6 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY agents/shared/ /app/shared/
+COPY agents/worker/ /app/worker/
+RUN pip install --no-cache-dir /app/shared/ /app/worker/
+CMD ["python", "-m", "worker.main"]

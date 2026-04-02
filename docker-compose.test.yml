@@ -1,0 +1,29 @@
+services:
+  integration-tests:
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+      llm-router:
+        condition: service_healthy
+      mock-llm:
+        condition: service_healthy
+      planner:
+        condition: service_healthy
+      bootstrapper:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+      reviewer:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:8080
+      - LLM_ROUTER_URL=http://llm-router:8081
+      - MOCK_LLM_URL=http://mock-llm:8000
+      - DATABASE_URL=postgres://finit:${PG_PASSWORD}@postgres:5432/finit
+    networks:
+      - finit-net

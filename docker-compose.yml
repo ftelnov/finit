@@ -1,0 +1,260 @@
+services:
+  # === Core ===
+  orchestrator:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgres://finit:${PG_PASSWORD}@postgres:5432/finit
+      - JWT_SECRET=${JWT_SECRET}
+      - LLM_ROUTER_URL=http://llm-router:8081
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_SERVICE_NAME=finit-orchestrator
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - finit-net
+
+  llm-router:
+    build:
+      context: .
+      dockerfile: llm-router/Dockerfile
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgres://finit:${PG_PASSWORD}@postgres:5432/finit
+      - JWT_SECRET=${JWT_SECRET}
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - CONFIG_PATH=/etc/finit/router.yaml
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_SERVICE_NAME=finit-llm-router
+    volumes:
+      - ./config/router.yaml:/etc/finit/router.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - finit-net
+
+  # === Agents ===
+  planner:
+    build:
+      context: .
+      dockerfile: agents/planner/Dockerfile
+    ports:
+      - "9000:9000"
+    environment:
+      - AGENT_TYPE=planner
+      - LLM_ROUTER_URL=http://llm-router:8081
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_SERVICE_NAME=finit-planner
+    depends_on:
+      llm-router:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - finit-net
+
+  bootstrapper:
+    build:
+      context: .
+      dockerfile: agents/bootstrapper/Dockerfile
+    ports:
+      - "9001:9001"
+    environment:
+      - AGENT_TYPE=bootstrapper
+      - LLM_ROUTER_URL=http://llm-router:8081
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_SERVICE_NAME=finit-bootstrapper
+    depends_on:
+      llm-router:
+        condition: service_healthy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - workspace-volumes:/var/lib/finit/workspaces
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - finit-net
+
+  worker:
+    build:
+      context: .
+      dockerfile: agents/worker/Dockerfile
+    ports:
+      - "9002:9002"
+    environment:
+      - AGENT_TYPE=worker
+      - LLM_ROUTER_URL=http://llm-router:8081
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_SERVICE_NAME=finit-worker
+    depends_on:
+      llm-router:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9002/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - finit-net
+
+  reviewer:
+    build:
+      context: .
+      dockerfile: agents/reviewer/Dockerfile
+    ports:
+      - "9003:9003"
+    environment:
+      - AGENT_TYPE=reviewer
+      - LLM_ROUTER_URL=http://llm-router:8081
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_SERVICE_NAME=finit-reviewer
+    depends_on:
+      llm-router:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9003/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - finit-net
+
+  # === Data Stores ===
+  postgres:
+    image: pgvector/pgvector:pg16
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=finit
+      - POSTGRES_USER=finit
+      - POSTGRES_PASSWORD=${PG_PASSWORD}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finit"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - finit-net
+
+  # === LLM Providers ===
+  mock-llm:
+    build:
+      context: .
+      dockerfile: mock-llm/Dockerfile
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - finit-net
+
+  # === Observability ===
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    ports:
+      - "4317:4317"
+      - "8889:8889"
+    volumes:
+      - ./config/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:13133/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - finit-net
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - finit-net
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./config/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - finit-net
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    ports:
+      - "5000:5000"
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:////mlflow/mlflow.db --default-artifact-root /mlflow/artifacts
+    volumes:
+      - mlflow-data:/mlflow
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - finit-net
+
+volumes:
+  pg-data:
+  prometheus-data:
+  grafana-data:
+  mlflow-data:
+  workspace-volumes:
+
+networks:
+  finit-net:
+    driver: bridge

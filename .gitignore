@@ -1,0 +1,61 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+*.whl
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Node
+node_modules/
+
+# Docker
+pg-data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# MLFlow local
+mlruns/
+mlartifacts/
+
+# Secrets
+secrets/
+*.pem
+*.key
