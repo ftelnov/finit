@@ -1,0 +1,65 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #27272a transparent;
+  }
+
+  *::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background-color: #27272a;
+    border-radius: 3px;
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background-color: #3f3f46;
+  }
+}
+
+@layer components {
+  .timeline-line {
+    @apply absolute left-4 top-0 bottom-0 w-px bg-surface-4;
+  }
+
+  .status-dot {
+    @apply w-2.5 h-2.5 rounded-full ring-2 ring-surface-1;
+  }
+
+  .card {
+    @apply bg-surface-2 border border-surface-4 rounded-lg;
+  }
+
+  .btn-primary {
+    @apply px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-lg
+           font-medium text-sm transition-colors duration-150
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply px-4 py-2 bg-surface-3 hover:bg-surface-4 text-zinc-200 rounded-lg
+           font-medium text-sm transition-colors duration-150 border border-surface-4;
+  }
+
+  .btn-danger {
+    @apply px-4 py-2 bg-red-600/20 hover:bg-red-600/30 text-red-400 rounded-lg
+           font-medium text-sm transition-colors duration-150 border border-red-600/30;
+  }
+
+  .input-field {
+    @apply w-full bg-surface-1 border border-surface-4 rounded-lg px-3 py-2
+           text-zinc-100 placeholder-zinc-500 text-sm
+           focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent
+           transition-colors duration-150;
+  }
+}

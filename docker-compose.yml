@@ -147,6 +147,25 @@ services:
     networks:
       - finit-net
 
+  # === WebUI ===
+  webui:
+    build:
+      context: ./webui
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - finit-net
+
   # === Data Stores ===
   postgres:
     image: pgvector/pgvector:pg16

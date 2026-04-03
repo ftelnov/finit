@@ -140,12 +140,9 @@ fn spawn_health_checker(state: AppState) {
                     failure_counts.remove(&agent.id);
                     if agent.status != "healthy" {
                         tracing::info!(agent_id = %agent.id, "agent recovered");
-                        let _ =
-                            db::update_agent_health(&state.pool, &agent.id, "healthy").await;
-                    } else {
-                        let _ =
-                            db::update_agent_health(&state.pool, &agent.id, "healthy").await;
                     }
+                    let _ =
+                        db::update_agent_health(&state.pool, &agent.id, "healthy").await;
                 } else {
                     let count = failure_counts.entry(agent.id.clone()).or_insert(0);
                     *count += 1;

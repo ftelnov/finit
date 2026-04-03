@@ -1,4 +1,4 @@
-.PHONY: up down test test-integration logs build clean grafana mlflow
+.PHONY: up down test test-integration logs build clean grafana mlflow ui dev-ui
 
 # Start all services
 up:
@@ -47,6 +47,14 @@ register-provider:
 	curl -X POST http://localhost:8081/v1/providers \
 		-H "Content-Type: application/json" \
 		-d '{"name":"custom","url":"$(URL)","models":["$(MODELS)"]}'
+
+# Open WebUI
+ui:
+	open http://localhost:3000
+
+# Dev mode for WebUI (with hot reload)
+dev-ui:
+	cd webui && npm run dev
 
 # Load test (requires k6)
 loadtest:
