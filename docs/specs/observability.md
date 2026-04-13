@@ -8,7 +8,7 @@
 
 | Компонент | Роль |
 |---|---|
-| **OpenTelemetry SDK** | Инструментация всех Go/Python сервисов |
+| **OpenTelemetry SDK** | Инструментация всех Rust/Python сервисов |
 | **OTel Collector** | Сбор, обработка, экспорт телеметрии |
 | **Prometheus** | Хранение метрик, алерты |
 | **Grafana** | Дашборды, визуализация |
@@ -215,6 +215,195 @@ Experiment: "finit-tasks"
   "response": "[logged only if mlflow.log_prompts=true]"
 }
 ```
+
+## Alerting Rules (Prometheus)
+
+### Конфигурация
+
+Alert rules загружаются Prometheus из `config/alerts.yml`. Alertmanager маршрутизирует уведомления по severity.
+
+### Правила алертинга
+
+```yaml
+groups:
+  - name: finit-llm-router
+    interval: 15s
+    rules:
+      # Провайдер недоступен (circuit breaker открыт)
+      - alert: LLMProviderDown
+        expr: finit_llm_circuit_breaker_state == 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "LLM provider {{ $labels.provider }} circuit breaker open"
+          description: "Provider {{ $labels.provider }} has been unhealthy for 30s. Failover active."
+
+      # Высокий error rate на LLM запросах
+      - alert: LLMHighErrorRate
+        expr: |
+          rate(finit_llm_requests_total{status=~"5.."}[5m])
+          / rate(finit_llm_requests_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LLM error rate > 5% for provider {{ $labels.provider }}"
+
+      # Все провайдеры недоступны
+      - alert: LLMAllProvidersDown
+        expr: sum(finit_llm_provider_health) == 0
+        for: 10s
+        labels:
+          severity: critical
+        annotations:
+          summary: "All LLM providers are down — tasks will be paused"
+
+      # Высокая латентность TTFT
+      - alert: LLMHighTTFT
+        expr: histogram_quantile(0.95, rate(finit_llm_ttft_seconds_bucket[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM TTFT p95 > 10s for {{ $labels.provider }}/{{ $labels.model }}"
+
+      # Утечка секрета заблокирована (информационный, но критический по природе)
+      - alert: SecretLeakageBlocked
+        expr: increase(finit_guardrail_blocks_total{type="secret"}[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Secret leakage attempt blocked — review audit log"
+
+      # Prompt injection заблокирован
+      - alert: PromptInjectionBlocked
+        expr: increase(finit_guardrail_blocks_total{type="injection"}[1h]) > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: "Multiple prompt injection attempts blocked ({{ $value }} in 1h)"
+
+  - name: finit-pipeline
+    interval: 15s
+    rules:
+      # Агент недоступен
+      - alert: AgentUnhealthy
+        expr: finit_agent_health == 0
+        for: 60s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Agent {{ $labels.agent }} is unhealthy for > 60s"
+
+      # Высокая латентность агента
+      - alert: AgentHighLatency
+        expr: histogram_quantile(0.95, rate(finit_agent_duration_seconds_bucket[10m])) > 120
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agent {{ $labels.agent }} p95 latency > 120s"
+
+      # Задача приближается к лимиту бюджета
+      - alert: TaskBudgetNearLimit
+        expr: finit_task_budget_utilization > 0.9
+        labels:
+          severity: warning
+        annotations:
+          summary: "Task budget utilization > 90% — approaching limit"
+
+      # Высокий escalation rate
+      - alert: HighEscalationRate
+        expr: |
+          rate(finit_task_total{status="escalated"}[1h])
+          / rate(finit_task_total[1h]) > 0.3
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Task escalation rate > 30% over last hour"
+
+      # Медленная сборка workspace
+      - alert: WorkspaceBuildSlow
+        expr: histogram_quantile(0.95, rate(finit_workspace_build_duration_seconds_bucket[15m])) > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Workspace build p95 > 90s"
+
+  - name: finit-infrastructure
+    interval: 15s
+    rules:
+      # Высокое потребление CPU контейнером
+      - alert: ContainerHighCPU
+        expr: rate(container_cpu_usage_seconds_total{name=~"finit.*"}[5m]) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.name }} CPU usage > 90% for 10m"
+
+      # Высокое потребление RAM контейнером
+      - alert: ContainerHighMemory
+        expr: container_memory_usage_bytes{name=~"finit.*"} / container_spec_memory_limit_bytes{name=~"finit.*"} > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.name }} RAM usage > 90%"
+
+      # PostgreSQL недоступен
+      - alert: PostgreSQLDown
+        expr: pg_up == 0
+        for: 10s
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL is down — all services affected"
+```
+
+### Маршрутизация алертов (Alertmanager)
+
+```yaml
+# config/alertmanager.yml
+route:
+  group_by: ['severity']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'default'
+
+  routes:
+    - match:
+        severity: critical
+      receiver: 'critical-webhook'
+      repeat_interval: 15m
+
+    - match:
+        severity: warning
+      receiver: 'default'
+      repeat_interval: 4h
+
+receivers:
+  - name: 'default'
+    # Grafana annotations (визуальная индикация на дашбордах)
+
+  - name: 'critical-webhook'
+    webhook_configs:
+      - url: '${ALERT_WEBHOOK_URL}'  # Telegram bot / Slack webhook
+        send_resolved: true
+```
+
+### Severity levels
+
+| Severity | Значение | Реакция |
+|---|---|---|
+| `critical` | Сервис деградирован, задачи блокированы | Push-уведомление оператору, автопауза задач |
+| `warning` | Деградация производительности, приближение к лимитам | Аннотация на дашборде, ручная проверка |
+
+---
 
 ## Health Checks
 

@@ -500,6 +500,205 @@ pub async fn delete_agent(
     }
 }
 
+// ─── Memory request/response types ──────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CreateMemoryRuleRequest {
+    pub scope_type: String,
+    pub scope_id: Option<String>,
+    pub content: String,
+    pub author_agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateMemoryFactRequest {
+    pub scope_type: String,
+    pub scope_id: Option<String>,
+    pub content: String,
+    pub tags: Option<Vec<String>>,
+    pub author_agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchMemoryFactsRequest {
+    pub scope_type: String,
+    pub scope_id: Option<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListMemoryQuery {
+    pub scope_type: Option<String>,
+    pub scope_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListWorkspacesQuery {
+    pub project_id: Option<String>,
+    pub status: Option<String>,
+}
+
+// ─── Memory handlers ────────────────────────────────────────────────────────
+
+/// POST /api/memory/rules - Create a new memory rule.
+pub async fn create_memory_rule(
+    State(state): State<AppState>,
+    Json(body): Json<CreateMemoryRuleRequest>,
+) -> Result<(StatusCode, Json<db::MemoryRule>), ApiError> {
+    if body.content.trim().is_empty() {
+        return Err(ApiError::bad_request("content must not be empty"));
+    }
+
+    let valid_scopes = ["workspace", "task", "global"];
+    if !valid_scopes.contains(&body.scope_type.as_str()) {
+        return Err(ApiError::bad_request(format!(
+            "scope_type must be one of: {}",
+            valid_scopes.join(", ")
+        )));
+    }
+
+    let rule = db::create_memory_rule(
+        &state.pool,
+        &body.scope_type,
+        body.scope_id.as_deref(),
+        &body.content,
+        body.author_agent.as_deref(),
+    )
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(rule)))
+}
+
+/// GET /api/memory/rules?scope_type=...&scope_id=... - List active memory rules.
+pub async fn list_memory_rules(
+    State(state): State<AppState>,
+    Query(query): Query<ListMemoryQuery>,
+) -> Result<Json<Vec<db::MemoryRule>>, ApiError> {
+    let rules = db::list_memory_rules(
+        &state.pool,
+        query.scope_type.as_deref(),
+        query.scope_id.as_deref(),
+    )
+    .await?;
+    Ok(Json(rules))
+}
+
+/// DELETE /api/memory/rules/{id} - Deactivate a memory rule (soft delete).
+pub async fn deactivate_memory_rule(
+    State(state): State<AppState>,
+    Path(id): Path<i32>,
+) -> Result<StatusCode, ApiError> {
+    let deactivated = db::deactivate_memory_rule(&state.pool, id).await?;
+    if deactivated {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found(format!("memory rule {} not found or already inactive", id)))
+    }
+}
+
+/// POST /api/memory/facts - Create a new memory fact.
+pub async fn create_memory_fact(
+    State(state): State<AppState>,
+    Json(body): Json<CreateMemoryFactRequest>,
+) -> Result<(StatusCode, Json<db::MemoryFact>), ApiError> {
+    if body.content.trim().is_empty() {
+        return Err(ApiError::bad_request("content must not be empty"));
+    }
+
+    let valid_scopes = ["workspace", "task", "global"];
+    if !valid_scopes.contains(&body.scope_type.as_str()) {
+        return Err(ApiError::bad_request(format!(
+            "scope_type must be one of: {}",
+            valid_scopes.join(", ")
+        )));
+    }
+
+    let fact = db::create_memory_fact(
+        &state.pool,
+        &body.scope_type,
+        body.scope_id.as_deref(),
+        &body.content,
+        body.tags.as_deref(),
+        body.author_agent.as_deref(),
+    )
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(fact)))
+}
+
+/// GET /api/memory/facts?scope_type=...&scope_id=... - List memory facts.
+pub async fn list_memory_facts(
+    State(state): State<AppState>,
+    Query(query): Query<ListMemoryQuery>,
+) -> Result<Json<Vec<db::MemoryFact>>, ApiError> {
+    let facts = db::list_memory_facts(
+        &state.pool,
+        query.scope_type.as_deref(),
+        query.scope_id.as_deref(),
+    )
+    .await?;
+    Ok(Json(facts))
+}
+
+/// POST /api/memory/facts/search - Search memory facts by tags.
+pub async fn search_memory_facts(
+    State(state): State<AppState>,
+    Json(body): Json<SearchMemoryFactsRequest>,
+) -> Result<Json<Vec<db::MemoryFact>>, ApiError> {
+    if body.tags.is_empty() {
+        return Err(ApiError::bad_request("tags must not be empty"));
+    }
+
+    let facts = db::search_memory_facts_by_tags(
+        &state.pool,
+        &body.scope_type,
+        body.scope_id.as_deref(),
+        &body.tags,
+    )
+    .await?;
+    Ok(Json(facts))
+}
+
+// ─── Workspace handlers ─────────────────────────────────────────────────────
+
+/// GET /api/workspaces/{id} - Get a specific workspace.
+pub async fn get_workspace(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<db::Workspace>, ApiError> {
+    let workspace = db::get_workspace(&state.pool, &id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("workspace {} not found", id)))?;
+    Ok(Json(workspace))
+}
+
+/// GET /api/workspaces?project_id=...&status=... - List workspaces.
+pub async fn list_workspaces(
+    State(state): State<AppState>,
+    Query(query): Query<ListWorkspacesQuery>,
+) -> Result<Json<Vec<db::Workspace>>, ApiError> {
+    let workspaces = db::list_workspaces(
+        &state.pool,
+        query.project_id.as_deref(),
+        query.status.as_deref(),
+    )
+    .await?;
+    Ok(Json(workspaces))
+}
+
+/// DELETE /api/workspaces/{id} - Soft-delete a workspace (marks as 'deleted').
+pub async fn delete_workspace(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let deleted = db::delete_workspace(&state.pool, &id).await?;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found(format!("workspace {} not found or already deleted", id)))
+    }
+}
+
 // ─── Health check ────────────────────────────────────────────────────────────
 
 /// GET /health - Health check endpoint.

@@ -133,8 +133,7 @@ export const useStore = create<AppState>((set, get) => ({
       workspaces: deriveWorkspaces(updated),
       selectedTaskId: task.id,
     });
-    // Auto-connect to the new task's SSE stream
-    get().connectToTask(task.id);
+    // SSE connection is managed by useAgUiConnection hook via selectedTaskId change
     return task;
   },
 
@@ -164,8 +163,7 @@ export const useStore = create<AppState>((set, get) => ({
   selectTask: (taskId) => {
     set({ selectedTaskId: taskId });
     if (taskId) {
-      get().connectToTask(taskId);
-      // Refresh task data
+      // Refresh task data; SSE connection is managed by useAgUiConnection hook
       api.getTask(taskId).then((task) => {
         const { tasks } = get();
         const exists = tasks.find((t) => t.id === taskId);
@@ -173,8 +171,6 @@ export const useStore = create<AppState>((set, get) => ({
           set({ tasks: tasks.map((t) => (t.id === taskId ? task : t)) });
         }
       }).catch(() => {});
-    } else {
-      get().disconnectFromTask();
     }
   },
 
@@ -194,19 +190,17 @@ export const useStore = create<AppState>((set, get) => ({
     const { transport: existing } = get();
     existing?.disconnect();
 
-    // Initialize events map for this task if not present
+    // Always reset events on connect - SSE replays all historical events
     const { taskEvents } = get();
-    if (!taskEvents.has(taskId)) {
-      const newEvents = new Map(taskEvents);
-      newEvents.set(taskId, {
-        timeline: [],
-        streamingText: new Map(),
-        awaitingInput: null,
-        finished: false,
-        error: null,
-      });
-      set({ taskEvents: newEvents });
-    }
+    const newEvents = new Map(taskEvents);
+    newEvents.set(taskId, {
+      timeline: [],
+      streamingText: new Map(),
+      awaitingInput: null,
+      finished: false,
+      error: null,
+    });
+    set({ taskEvents: newEvents });
 
     const transport = createTransport(
       (event: AgUiEvent, seq: number) => {

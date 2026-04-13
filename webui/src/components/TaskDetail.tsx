@@ -1,12 +1,10 @@
 import { useStore } from "../stores/store";
 import { useAgUiConnection } from "../hooks/useAgUi";
-import { StatusBadge } from "./StatusBadge";
 import { AgentTimeline } from "./AgentTimeline";
 import { SpecApproval } from "./SpecApproval";
 import { UserInputPanel } from "./UserInputPanel";
 import { TaskHeader } from "./TaskHeader";
 import { AgentFlowDiagram } from "./AgentFlowDiagram";
-import type { TaskStatus } from "../types";
 import { clsx } from "clsx";
 
 interface TaskDetailProps {
@@ -61,17 +59,19 @@ export function TaskDetail({ taskId }: TaskDetailProps) {
             )}
 
             {/* Error display */}
-            {events?.error && (
+            {(task.status === "failed" || events?.error) && (
               <div className="card p-4 border-red-500/30">
                 <div className="text-sm font-medium text-red-400 mb-1">
-                  Error
+                  Task Failed
                 </div>
-                <div className="text-sm text-zinc-400">{events.error}</div>
+                <div className="text-sm text-zinc-400">
+                  {events?.error ?? task.error ?? "An unknown error occurred"}
+                </div>
               </div>
             )}
 
             {/* Completed state */}
-            {events?.finished && !events.error && (
+            {task.status === "completed" && (
               <div className="card p-4 border-accent/30">
                 <div className="text-sm font-medium text-accent mb-1">
                   Task Completed

@@ -476,6 +476,73 @@ POST /v1/providers
 3. **Token Budget Enforcement**: проверка `X-Task-ID` → remaining budget. Reject если бюджет исчерпан.
 4. **Output Validation**: structured output JSON schema enforcement на ответ LLM.
 
+### 8.5 Семантическое кэширование LLM-ответов
+
+LLM Router поддерживает семантический кэш для повторяющихся запросов. Цель -- сократить латентность и стоимость для идентичных или семантически близких промптов (типовые вопросы агентов, повторная генерация boilerplate-кода).
+
+**Архитектура кэша:**
+
+```
+Agent Request
+    ↓
+[Guardrails]  → pass
+    ↓
+[Semantic Cache Lookup]
+    ↓ cache hit (similarity ≥ threshold)
+    → return cached response (skip provider call)
+    ↓ cache miss
+[Provider Call] → response
+    ↓
+[Cache Store] → save embedding + response
+    ↓
+Agent Response
+```
+
+**Реализация:**
+
+| Параметр | Значение | Обоснование |
+|---|---|---|
+| Хранилище | PostgreSQL + pgvector | Единая БД, уже используется для фактов |
+| Embedding-модель | `all-MiniLM-L6-v2` (384d) | Та же модель, что и для памяти фактов — нет дополнительного overhead |
+| Порог схожести | 0.95 cosine similarity (конфигурируемый) | Высокий порог для минимизации ложных попаданий |
+| Ключ кэша | Embedding конкатенации user-сообщений (без system prompt) | System prompt стабилен, различия — в пользовательских сообщениях |
+| Scope | Per-model, per-agent | Разные модели и агенты — разные кэш-бакеты |
+| TTL | 24 часа (конфигурируемый) | Баланс между актуальностью и экономией |
+| Инвалидация | TTL + ручной flush через Management API | `DELETE /v1/cache` — очистка; `DELETE /v1/cache?model=X` — по модели |
+| Когда НЕ кэшировать | `temperature > 0`, заголовок `X-No-Cache: true`, streaming-запросы | Недетерминированные и потоковые запросы не кэшируются |
+
+**Метрики кэша:**
+
+| Метрика | Тип | Описание |
+|---|---|---|
+| `finit_llm_cache_hits_total` | counter | Попадания в кэш |
+| `finit_llm_cache_misses_total` | counter | Промахи кэша |
+| `finit_llm_cache_hit_ratio` | gauge | Hit rate за последние 5 минут |
+| `finit_llm_cache_latency_seconds` | histogram | Латентность lookup (embedding + search) |
+| `finit_llm_cache_size` | gauge | Количество записей в кэше |
+
+**Схема PostgreSQL:**
+
+```sql
+CREATE TABLE llm_cache (
+    id              SERIAL PRIMARY KEY,
+    model           TEXT NOT NULL,
+    agent_id        TEXT NOT NULL,
+    messages_hash   TEXT NOT NULL,          -- SHA256 для быстрого exact match
+    embedding       vector(384) NOT NULL,   -- для semantic match
+    response        JSONB NOT NULL,
+    tokens_saved    INT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_llm_cache_exact ON llm_cache(model, agent_id, messages_hash);
+CREATE INDEX idx_llm_cache_semantic ON llm_cache USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX idx_llm_cache_expiry ON llm_cache(expires_at);
+```
+
+Lookup выполняется в два этапа: сначала exact match по SHA256 hash (O(1)), затем semantic search по embedding если exact miss (IVFFlat index).
+
 Подробная спецификация: [docs/specs/llm-router.md](specs/llm-router.md).
 
 ---
@@ -547,7 +614,86 @@ User Request [trace_id=abc]
 
 MLFlow трекинг инициируется LLM Router: каждый proxied request автоматически логируется.
 
-### 9.5 Health checks
+### 9.5 Версионирование промптов
+
+Промпты агентов эволюционируют. Стратегия версионирования обеспечивает отслеживание, сравнение и безопасное обновление промптов.
+
+**Три уровня версионирования:**
+
+| Уровень | Что версионируется | Где хранится | Как обновляется |
+|---|---|---|---|
+| **Шаблоны промптов** | Системные промпты агентов, structured output JSON schemas | Git-репозиторий (`prompts/v{N}/`) | Коммит → новая версия |
+| **Runtime-конфигурация** | Активная версия промпта per-agent, параметры (temperature, top_p) | PostgreSQL `prompt_configs` | API или конфиг |
+| **Аудит вызовов** | Полный prompt + response + версия шаблона | MLFlow artifacts | Автоматически LLM Router |
+
+**Структура хранения шаблонов:**
+
+```
+prompts/
+├── planner/
+│   ├── v1/
+│   │   ├── system.md
+│   │   └── schema.json
+│   └── v2/
+│       ├── system.md
+│       ├── schema.json
+│       └── CHANGELOG.md
+├── worker/
+│   └── v1/ ...
+└── reviewer/
+    └── v1/ ...
+```
+
+**A/B тестирование промптов:**
+
+Router поддерживает маршрутизацию по версии промпта через конфигурацию:
+
+```yaml
+prompt_routing:
+  planner:
+    versions:
+      - version: "v1"
+        weight: 80       # 80% трафика
+      - version: "v2"
+        weight: 20       # 20% трафика
+    metrics_window: "24h" # окно сравнения
+```
+
+Каждый LLM-вызов логируется в MLFlow с тегом `prompt_version`. Сравнение метрик:
+
+- **Review pass rate** per prompt version
+- **Iteration count** per prompt version (меньше итераций = лучше промпт)
+- **Token usage** per prompt version (эффективность)
+- **Structured output validity** per prompt version
+
+**Canary rollout:**
+
+```
+1. Новая версия промпта коммитится в git (prompts/{agent}/v{N+1}/)
+2. Конфигурация: weight=5 для новой версии, weight=95 для текущей
+3. Мониторинг 24-48h: сравнение метрик в Grafana (дашборд "Prompt Versions")
+4. При деградации: вес новой версии → 0, откат мгновенный (без деплоя)
+5. При успехе: постепенное увеличение веса (5 → 25 → 50 → 100)
+6. Полный rollout: старая версия архивируется
+```
+
+**Таблица PostgreSQL:**
+
+```sql
+CREATE TABLE prompt_configs (
+    id              SERIAL PRIMARY KEY,
+    agent_id        TEXT NOT NULL,
+    version         TEXT NOT NULL,           -- "v1", "v2"
+    weight          INT NOT NULL DEFAULT 100, -- вес для A/B
+    template_path   TEXT NOT NULL,           -- путь в git
+    parameters      JSONB DEFAULT '{}',     -- temperature, top_p, etc.
+    active          BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(agent_id, version)
+);
+```
+
+### 9.6 Health checks
 
 Каждый сервис реализует `GET /health`:
 
@@ -693,21 +839,87 @@ Tertiary Provider / Mock LLM
 
 ## 13. Технические и операционные ограничения
 
-### 13.1 Целевые показатели
+### 13.1 SLO (Service Level Objectives)
 
-| Метрика | Целевой показатель | Обоснование |
+Целевые показатели формализованы как SLO с привязкой к алертам Prometheus. Каждый SLO имеет alert threshold, при пересечении которого срабатывает оповещение.
+
+| SLO ID | Метрика | Цель | Alert threshold | Окно | Severity |
+|---|---|---|---|---|---|
+| SLO-1 | Workspace build time (p95) | < 60s | p95 > 90s за 15m | 15 min | warning |
+| SLO-2 | A2A round-trip latency (p99) | < 100ms | p99 > 200ms за 5m | 5 min | warning |
+| SLO-3 | AG-UI event delivery latency | < 200ms | p95 > 500ms за 5m | 5 min | warning |
+| SLO-4 | LLM Router availability | 99.5% | error rate > 5% за 5m | 5 min | critical |
+| SLO-5 | Task completion rate | > 90% | completion rate < 80% за 1h | 1 hour | warning |
+| SLO-6 | LLM provider failover time | < 1s | failover > 3s | per-event | critical |
+| SLO-7 | Guardrail false negative rate | 0% (по секретам) | Любая утечка секрета | per-event | critical |
+| SLO-8 | Agent health uptime | 99.9% | agent unhealthy > 60s | 1 min | critical |
+
+**Prometheus alert rules** (см. полную конфигурацию в [docs/specs/observability.md](specs/observability.md)):
+
+```yaml
+groups:
+  - name: finit-slo
+    rules:
+      # SLO-1: Workspace build time
+      - alert: WorkspaceBuildSlow
+        expr: histogram_quantile(0.95, rate(finit_workspace_build_duration_seconds_bucket[15m])) > 90
+        for: 5m
+        labels:
+          severity: warning
+          slo: SLO-1
+        annotations:
+          summary: "Workspace build p95 > 90s"
+
+      # SLO-4: LLM Router availability
+      - alert: LLMRouterHighErrorRate
+        expr: |
+          rate(finit_llm_requests_total{status=~"5.."}[5m])
+          / rate(finit_llm_requests_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          slo: SLO-4
+        annotations:
+          summary: "LLM Router error rate > 5%"
+
+      # SLO-6: Provider failover
+      - alert: ProviderFailoverSlow
+        expr: finit_llm_circuit_breaker_state > 0 and ON() increase(finit_llm_requests_total{status="503"}[1m]) > 0
+        for: 3s
+        labels:
+          severity: critical
+          slo: SLO-6
+
+      # SLO-8: Agent health
+      - alert: AgentUnhealthy
+        expr: finit_agent_health == 0
+        for: 60s
+        labels:
+          severity: critical
+          slo: SLO-8
+        annotations:
+          summary: "Agent {{ $labels.agent }} unhealthy > 60s"
+```
+
+**Эскалация алертов:**
+
+| Severity | Канал | Действие |
 |---|---|---|
-| Workspace build (p95) | < 60s | Docker layer caching |
-| A2A round-trip (localhost) | < 100ms | JSON-RPC over HTTP overhead |
-| AG-UI event latency | < 200ms | SSE delivery от события до WebUI |
-| LLM TTFT (p95) | Зависит от провайдера | Трекается Router-ом, не контролируется |
+| `warning` | Grafana dashboard annotation | Визуальная индикация, без push-уведомления |
+| `critical` | Webhook → (Telegram / Slack / email) | Push-уведомление оператору |
+| `critical` (> 5 min unresolved) | Автоматическая пауза задач | Оркестратор приостанавливает новые задачи |
+
+### 13.2 Операционные лимиты
+
+| Метрика | Значение | Обоснование |
+|---|---|---|
 | Concurrent tasks | 5 | Ресурсы одной машины |
 | Max task duration | 30 min | Предотвращение зависаний |
 | Max LLM calls per task | 50 | Контроль расходов |
 | Max tokens per task | 500K | Контроль расходов |
 | Max review iterations | 3 | Предотвращение бесконечных циклов |
 
-### 13.2 Операционные ограничения
+### 13.3 Операционные ограничения
 
 - **Single machine**: все компоненты на одном хосте (32GB+ RAM, GPU для vLLM/Ollama)
 - **Docker**: Docker Desktop (macOS) / Docker Engine (Linux). Без Firecracker/Kata в MVP

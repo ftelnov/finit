@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
 mod auth;
+mod cache;
 mod circuit_breaker;
 mod config;
+mod guardrails;
 mod management;
 mod metrics;
 mod provider;
@@ -10,6 +12,7 @@ mod proxy;
 mod routing;
 
 use config::RouterConfig;
+use guardrails::Guardrails;
 use pingora::server::configuration::Opt;
 use pingora::server::Server;
 use provider::ProviderPool;
@@ -71,12 +74,30 @@ fn main() {
     // Optional: PostgreSQL for budget tracking (pool created lazily)
     let db_url = get_db_url();
 
+    // Create the LLM cache
+    let llm_cache = cache::LlmCache::new(config.cache.ttl_seconds)
+        .with_semantic_threshold(config.cache.semantic_threshold);
+
+    // Create guardrails
+    let guardrails = Arc::new(Guardrails::new(
+        config.guardrails.prompt_injection,
+        config.guardrails.secret_scan,
+    ));
+    tracing::info!(
+        prompt_injection = config.guardrails.prompt_injection,
+        secret_scan = config.guardrails.secret_scan,
+        "guardrails initialized"
+    );
+
     // Create the proxy service
     let llm_proxy = LlmRouterProxy {
         pool: pool.clone(),
         http_client,
         db_url,
         db_pool: tokio::sync::OnceCell::new(),
+        cache: llm_cache,
+        cache_enabled: config.cache.enabled,
+        guardrails,
     };
 
     // Parse Pingora options
@@ -107,7 +128,18 @@ fn main() {
     );
     server.add_service(bg_health);
 
-    // Run the server
+    // Start background cache cleanup (expires old entries every 5 minutes)
+    let bg_cache = pingora::services::background::background_service(
+        "cache-cleanup",
+        CacheCleanupService {
+            cache: cache::LlmCache::new(config.cache.ttl_seconds),
+            db_url: get_db_url(),
+            interval: Duration::from_secs(300),
+        },
+    );
+    server.add_service(bg_cache);
+
+    // Run the server (Pingora handles SIGTERM/SIGINT with graceful drain)
     tracing::info!("starting Pingora server");
     server.run_forever();
 }
@@ -151,6 +183,64 @@ impl pingora::services::background::BackgroundService for HealthCheckService {
                 }
                 _ = shutdown.changed() => {
                     tracing::info!("health check service shutting down");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Background service for periodic cache cleanup (expired entries).
+struct CacheCleanupService {
+    cache: cache::LlmCache,
+    db_url: Option<String>,
+    interval: Duration,
+}
+
+#[async_trait::async_trait]
+impl pingora::services::background::BackgroundService for CacheCleanupService {
+    async fn start(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        let db_url = match &self.db_url {
+            Some(url) => url,
+            None => {
+                tracing::info!("cache cleanup disabled (no DATABASE_URL)");
+                return;
+            }
+        };
+
+        let db_pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(db_url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(error = %e, "cache cleanup: failed to connect to DB");
+                return;
+            }
+        };
+
+        tracing::info!(
+            interval_s = self.interval.as_secs(),
+            "starting cache cleanup background service"
+        );
+
+        let mut interval = tokio::time::interval(self.interval);
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    match self.cache.cleanup_expired(&db_pool).await {
+                        Ok(n) if n > 0 => tracing::info!(deleted = n, "cleaned up expired cache entries"),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "cache cleanup failed"),
+                    }
+                }
+                _ = shutdown.changed() => {
+                    tracing::info!("cache cleanup service shutting down");
+                    // Final cleanup before exit
+                    let _ = self.cache.cleanup_expired(&db_pool).await;
+                    db_pool.close().await;
                     return;
                 }
             }

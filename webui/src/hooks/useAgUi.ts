@@ -1,31 +1,23 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { useStore } from "../stores/store";
 
 /**
  * Hook to manage AG-UI SSE connection lifecycle.
  * Connects when a task is selected, disconnects on unmount or task change.
+ * Properly handles React StrictMode's double-invoke of effects.
  */
 export function useAgUiConnection(taskId: string | null) {
   const connectToTask = useStore((s) => s.connectToTask);
   const disconnectFromTask = useStore((s) => s.disconnectFromTask);
-  const prevTaskId = useRef<string | null>(null);
 
   useEffect(() => {
-    if (taskId && taskId !== prevTaskId.current) {
+    if (taskId) {
       connectToTask(taskId);
-      prevTaskId.current = taskId;
     }
-
-    return () => {
-      // Don't disconnect on every re-render, only on true unmount
-    };
-  }, [taskId, connectToTask]);
-
-  useEffect(() => {
     return () => {
       disconnectFromTask();
     };
-  }, [disconnectFromTask]);
+  }, [taskId, connectToTask, disconnectFromTask]);
 }
 
 /**

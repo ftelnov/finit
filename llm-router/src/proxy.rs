@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::auth;
+use crate::cache::LlmCache;
+use crate::guardrails::Guardrails;
 use crate::management;
 use crate::metrics;
 use crate::provider::{ProviderPool, ProviderState};
@@ -35,6 +37,16 @@ pub struct RequestCtx {
     pub is_streaming: bool,
     /// Prompt hash for cache-aware routing
     pub prompt_hash: Option<u64>,
+    /// Agent ID from X-Agent-ID header
+    pub agent_id: Option<String>,
+    /// SHA256 cache key for exact-match lookup
+    pub cache_hash: Option<String>,
+    /// Unique request ID for audit logging
+    pub request_id: String,
+    /// Time-to-first-token in milliseconds (streaming only)
+    pub ttft_ms: Option<u64>,
+    /// Prompt version from X-Prompt-Version header (for A/B tracking)
+    pub prompt_version: Option<String>,
 }
 
 /// The main LLM Router proxy implementation
@@ -43,6 +55,9 @@ pub struct LlmRouterProxy {
     pub http_client: reqwest::Client,
     pub db_url: Option<String>,
     pub db_pool: tokio::sync::OnceCell<sqlx::PgPool>,
+    pub cache: LlmCache,
+    pub cache_enabled: bool,
+    pub guardrails: Arc<Guardrails>,
 }
 
 impl LlmRouterProxy {
@@ -74,6 +89,11 @@ impl ProxyHttp for LlmRouterProxy {
             response_handled: false,
             is_streaming: false,
             prompt_hash: None,
+            agent_id: None,
+            cache_hash: None,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            ttft_ms: None,
+            prompt_version: None,
         }
     }
 
@@ -116,6 +136,36 @@ impl ProxyHttp for LlmRouterProxy {
         if method == http::Method::POST && path == "/v1/providers" {
             let body = read_full_body(session).await?;
             management::handle_register_provider(session, &self.pool, &body).await?;
+            ctx.response_handled = true;
+            return Ok(true);
+        }
+
+        // DELETE /v1/cache or DELETE /v1/cache?model=X
+        if method == http::Method::DELETE && path == "/v1/cache" {
+            if let Some(db) = self.get_db().await {
+                let model_filter = session
+                    .req_header()
+                    .uri
+                    .query()
+                    .and_then(|q| {
+                        q.split('&')
+                            .find_map(|pair| pair.strip_prefix("model="))
+                            .map(|s| s.to_string())
+                    });
+                match self.cache.flush(db, model_filter.as_deref()).await {
+                    Ok(deleted) => {
+                        let body = json!({"message": "cache flushed", "deleted": deleted});
+                        management::write_json_response(session, 200, &body).await?;
+                    }
+                    Err(e) => {
+                        let body = json!({"error": {"message": format!("cache flush failed: {}", e), "type": "server_error"}});
+                        management::write_json_response(session, 500, &body).await?;
+                    }
+                }
+            } else {
+                let body = json!({"error": {"message": "database not configured", "type": "server_error"}});
+                management::write_json_response(session, 503, &body).await?;
+            }
             ctx.response_handled = true;
             return Ok(true);
         }
@@ -195,10 +245,88 @@ impl ProxyHttp for LlmRouterProxy {
             ctx.model = Some(model.clone());
             ctx.is_streaming = parsed["stream"].as_bool().unwrap_or(false);
 
+            // Extract agent ID
+            ctx.agent_id = session
+                .req_header()
+                .headers
+                .get("x-agent-id")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            // Extract prompt version for A/B tracking
+            ctx.prompt_version = session
+                .req_header()
+                .headers
+                .get("x-prompt-version")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
             // Compute prompt hash for cache-aware routing
             ctx.prompt_hash = compute_prompt_hash(&parsed);
 
-            // 5. Budget check (if DB is configured and task_id is present)
+            // 4b. Guardrails check
+            let guardrail_result = self.guardrails.check_request(&parsed["messages"]);
+            if guardrail_result.blocked {
+                let violation_type = guardrail_result.violation_type.as_deref().unwrap_or("unknown");
+                let reason = guardrail_result.reason.as_deref().unwrap_or("request blocked by guardrails");
+                tracing::warn!(
+                    violation_type = violation_type,
+                    reason = reason,
+                    model = %model,
+                    "guardrail blocked request"
+                );
+                metrics::LLM_GUARDRAIL_BLOCKS
+                    .with_label_values(&[violation_type])
+                    .inc();
+                let body = json!({
+                    "error": {
+                        "message": reason,
+                        "type": "guardrail_violation",
+                        "violation_type": violation_type
+                    }
+                });
+                management::write_json_response(session, 403, &body).await?;
+                ctx.response_handled = true;
+                return Ok(true);
+            }
+
+            // 5a. Cache lookup (non-streaming only, skip if X-No-Cache header)
+            let no_cache = session
+                .req_header()
+                .headers
+                .get("x-no-cache")
+                .is_some();
+
+            if self.cache_enabled && !ctx.is_streaming && !no_cache {
+                let agent_id = ctx.agent_id.as_deref().unwrap_or("unknown");
+                let cache_hash =
+                    LlmCache::compute_hash(&model, agent_id, &parsed["messages"]);
+                ctx.cache_hash = Some(cache_hash.clone());
+
+                if let Some(db) = self.get_db().await {
+                    if let Some(cached) = self.cache.lookup(db, &model, agent_id, &cache_hash).await {
+                        tracing::info!(model = %model, agent = agent_id, "cache hit");
+                        metrics::LLM_CACHE_HITS.inc();
+
+                        let body_bytes = serde_json::to_vec(&cached.response).unwrap_or_default();
+                        let mut resp = ResponseHeader::build(200, None)?;
+                        resp.insert_header("Content-Type", "application/json")?;
+                        resp.insert_header("Content-Length", body_bytes.len().to_string())?;
+                        resp.insert_header("X-Cache", "HIT")?;
+                        session
+                            .write_response_header(Box::new(resp), false)
+                            .await?;
+                        session
+                            .write_response_body(Some(Bytes::from(body_bytes)), true)
+                            .await?;
+                        ctx.response_handled = true;
+                        return Ok(true);
+                    }
+                    metrics::LLM_CACHE_MISSES.inc();
+                }
+            }
+
+            // 5b. Budget check (if DB is configured and task_id is present)
             if let (Some(db), Some(task_id)) = (self.get_db().await, &ctx.task_id) {
                 match check_budget(db, task_id).await {
                     Ok(false) => {
@@ -504,6 +632,11 @@ impl LlmRouterProxy {
                     Ok(chunk) => {
                         total_chunks += 1;
 
+                        // Track time-to-first-token
+                        if total_chunks == 1 {
+                            ctx.ttft_ms = Some(ctx.start_time.elapsed().as_millis() as u64);
+                        }
+
                         // Try to extract usage from the chunk (final SSE chunk)
                         if let Some(usage) = extract_usage_from_sse_chunk(&chunk) {
                             usage_data = Some(usage);
@@ -524,19 +657,19 @@ impl LlmRouterProxy {
             session.write_response_body(None, true).await?;
 
             // Record token metrics from usage data
-            self.record_usage(provider, ctx, usage_data, total_chunks).await;
+            self.record_usage(provider, ctx, usage_data, total_chunks, resp_status).await;
         } else {
             // Non-streaming: read the full response body
             let body_bytes = response.bytes().await.map_err(|e| {
                 anyhow::anyhow!("error reading response body from provider: {}", e)
             })?;
 
-            // Extract usage data for token tracking
-            let usage_data = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-                .ok()
-                .and_then(|v| v.get("usage").cloned());
+            // Parse for usage data and caching
+            let parsed_response = serde_json::from_slice::<serde_json::Value>(&body_bytes).ok();
+            let usage_data = parsed_response.as_ref().and_then(|v| v.get("usage").cloned());
 
             resp_header.insert_header("Content-Length", body_bytes.len().to_string())?;
+            resp_header.insert_header("X-Cache", "MISS")?;
             session
                 .write_response_header(Box::new(resp_header), false)
                 .await?;
@@ -545,7 +678,24 @@ impl LlmRouterProxy {
                 .await?;
 
             // Record token metrics
-            self.record_usage(provider, ctx, usage_data, 0).await;
+            self.record_usage(provider, ctx, usage_data.clone(), 0, resp_status).await;
+
+            // Store in cache (non-streaming, successful, DB available)
+            if self.cache_enabled && status.is_success() {
+                if let (Some(db), Some(hash), Some(resp_val)) =
+                    (self.get_db().await, &ctx.cache_hash, &parsed_response)
+                {
+                    let agent_id = ctx.agent_id.as_deref().unwrap_or("unknown");
+                    let model = ctx.model.as_deref().unwrap_or("unknown");
+                    let tokens = usage_data
+                        .as_ref()
+                        .and_then(|u| u["total_tokens"].as_i64())
+                        .unwrap_or(0) as i32;
+                    self.cache
+                        .store(db, model, agent_id, hash, resp_val, tokens)
+                        .await;
+                }
+            }
         }
 
         ctx.response_handled = true;
@@ -559,6 +709,7 @@ impl LlmRouterProxy {
         ctx: &RequestCtx,
         usage: Option<serde_json::Value>,
         fallback_chunks: u64,
+        status_code: u16,
     ) {
         let model = ctx.model.as_deref().unwrap_or("unknown");
 
@@ -601,6 +752,31 @@ impl LlmRouterProxy {
             let total_tokens = (input_tokens + output_tokens) as i64;
             if let Err(e) = update_budget(db, task_id, total_tokens, cost).await {
                 tracing::warn!(error = %e, task_id = %task_id, "failed to update budget");
+            }
+        }
+
+        // Insert audit row into llm_usage table
+        if let Some(db) = self.get_db().await {
+            let result = sqlx::query(
+                "INSERT INTO llm_usage (request_id, task_id, agent_id, provider_id, model, input_tokens, output_tokens, cost_dollars, ttft_ms, total_latency_ms, status, prompt_version)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"
+            )
+            .bind(&ctx.request_id)
+            .bind(ctx.task_id.as_deref())
+            .bind(ctx.agent_id.as_deref())
+            .bind(&provider.name)
+            .bind(model)
+            .bind(input_tokens as i32)
+            .bind(output_tokens as i32)
+            .bind(cost)
+            .bind(ctx.ttft_ms.map(|v| v as i32))
+            .bind(ctx.start_time.elapsed().as_millis() as i32)
+            .bind(status_code as i32)
+            .bind(ctx.prompt_version.as_deref())
+            .execute(db)
+            .await;
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "failed to log llm_usage");
             }
         }
 
@@ -672,7 +848,9 @@ fn extract_usage_from_sse_chunk(chunk: &Bytes) -> Option<serde_json::Value> {
     let text = std::str::from_utf8(chunk).ok()?;
 
     for line in text.lines() {
-        let data = line.strip_prefix("data: ")?;
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
         if data == "[DONE]" {
             continue;
         }
@@ -688,7 +866,7 @@ fn extract_usage_from_sse_chunk(chunk: &Bytes) -> Option<serde_json::Value> {
 
 /// Check if the task has remaining budget
 async fn check_budget(db: &sqlx::PgPool, task_id: &str) -> anyhow::Result<bool> {
-    let row = sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+    let row = sqlx::query_as::<_, (i32, i32)>(
         "SELECT spent_tokens, max_tokens FROM task_budgets WHERE task_id = $1",
     )
     .bind(task_id)
@@ -696,13 +874,13 @@ async fn check_budget(db: &sqlx::PgPool, task_id: &str) -> anyhow::Result<bool> 
     .await?;
 
     match row {
-        Some((Some(spent), Some(max_tokens))) => Ok(spent < max_tokens),
-        Some(_) => Ok(true), // No budget limit set
-        None => Ok(true),    // No budget row means no limit
+        Some((spent, max_tokens)) => Ok(spent < max_tokens),
+        None => Ok(true), // No budget row means no limit
     }
 }
 
-/// Update the budget after a successful request
+/// Update the budget after a successful request.
+/// Only UPDATE existing rows — the orchestrator creates the budget row at task creation.
 async fn update_budget(
     db: &sqlx::PgPool,
     task_id: &str,
@@ -710,14 +888,13 @@ async fn update_budget(
     cost: f64,
 ) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO task_budgets (task_id, spent_tokens, spent_cost)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (task_id)
-         DO UPDATE SET spent_tokens = task_budgets.spent_tokens + $2,
-                       spent_cost = task_budgets.spent_cost + $3",
+        "UPDATE task_budgets
+         SET spent_tokens = spent_tokens + $2,
+             spent_cost = spent_cost + $3
+         WHERE task_id = $1",
     )
     .bind(task_id)
-    .bind(tokens)
+    .bind(tokens as i32)
     .bind(cost)
     .execute(db)
     .await?;

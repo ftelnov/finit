@@ -8,13 +8,13 @@ use std::collections::HashMap;
 /// Hashes the system prompt (+ first N tokens) and routes to the provider that
 /// previously handled similar prefixes, maximizing KV cache reuse.
 ///
-/// Uses a simple HashMap<u64, usize> (prompt_hash -> provider_idx) with LRU eviction.
+/// Stores provider **name** (not index) to be robust across topology changes.
 pub struct CacheAware {
     inner: Mutex<CacheAwareInner>,
 }
 
 struct CacheAwareInner {
-    /// Maps prompt hash to (provider_idx, last_access_order)
+    /// Maps prompt hash to (provider_name, last_access_order)
     cache: HashMap<u64, CacheEntry>,
     /// Monotonically increasing access counter for LRU
     access_counter: u64,
@@ -23,7 +23,7 @@ struct CacheAwareInner {
 }
 
 struct CacheEntry {
-    provider_idx: usize,
+    provider_name: String,
     last_access: u64,
 }
 
@@ -44,7 +44,6 @@ impl CacheAware {
             return;
         }
 
-        // Find the entry with the smallest last_access value
         let lru_key = inner
             .cache
             .iter()
@@ -70,7 +69,6 @@ impl RoutingStrategy for CacheAware {
         let prompt_hash = match request.prompt_hash {
             Some(h) => h,
             None => {
-                // No prompt hash available, fall back to least-load
                 return select_least_load(providers);
             }
         };
@@ -80,14 +78,13 @@ impl RoutingStrategy for CacheAware {
         let access = inner.access_counter;
 
         if let Some(entry) = inner.cache.get_mut(&prompt_hash) {
-            let cached_idx = entry.provider_idx;
             entry.last_access = access;
 
-            // Check if the cached provider is still in the candidate list
-            if cached_idx < providers.len() {
-                return Some(cached_idx);
+            // Find the cached provider by name in the current candidate list
+            if let Some(idx) = providers.iter().position(|p| p.name == entry.provider_name) {
+                return Some(idx);
             }
-            // Cached provider not available, remove stale entry
+            // Cached provider not in current candidates (unhealthy/removed), evict
             inner.cache.remove(&prompt_hash);
         }
 
@@ -97,7 +94,7 @@ impl RoutingStrategy for CacheAware {
         inner.cache.insert(
             prompt_hash,
             CacheEntry {
-                provider_idx: selected,
+                provider_name: providers[selected].name.clone(),
                 last_access: access,
             },
         );

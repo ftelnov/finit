@@ -154,6 +154,7 @@ CREATE TABLE llm_usage (
     ttft_ms         INT,
     total_latency_ms INT,
     status          INT NOT NULL,
+    prompt_version  TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -174,9 +175,42 @@ CREATE INDEX idx_workspaces_project_status ON workspaces(project_id, status);
 -- Memory indexes
 CREATE INDEX idx_memory_rules_scope ON memory_rules(scope_type, scope_id) WHERE active = TRUE;
 CREATE INDEX idx_memory_facts_scope ON memory_facts(scope_type, scope_id);
-CREATE INDEX idx_memory_facts_embedding ON memory_facts USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX idx_memory_facts_embedding ON memory_facts USING hnsw (embedding vector_cosine_ops);
 
 -- LLM usage indexes
 CREATE INDEX idx_llm_usage_task ON llm_usage(task_id);
 CREATE INDEX idx_llm_usage_agent ON llm_usage(agent_id);
 CREATE INDEX idx_llm_usage_created ON llm_usage(created_at);
+CREATE INDEX idx_llm_usage_prompt_version ON llm_usage(agent_id, prompt_version) WHERE prompt_version IS NOT NULL;
+
+-- ===== Semantic cache for LLM responses =====
+
+CREATE TABLE llm_cache (
+    id              SERIAL PRIMARY KEY,
+    model           TEXT NOT NULL,
+    agent_id        TEXT NOT NULL,
+    messages_hash   TEXT NOT NULL,
+    embedding       vector(384),
+    response        JSONB NOT NULL,
+    tokens_saved    INT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ NOT NULL,
+    CONSTRAINT llm_cache_exact_uq UNIQUE (model, agent_id, messages_hash)
+);
+
+CREATE INDEX idx_llm_cache_expiry ON llm_cache(expires_at);
+CREATE INDEX idx_llm_cache_semantic ON llm_cache USING hnsw (embedding vector_cosine_ops);
+
+-- ===== Prompt versioning =====
+
+CREATE TABLE prompt_configs (
+    id              SERIAL PRIMARY KEY,
+    agent_id        TEXT NOT NULL,
+    version         TEXT NOT NULL,
+    weight          INT NOT NULL DEFAULT 100,
+    template_path   TEXT NOT NULL,
+    parameters      JSONB DEFAULT '{}',
+    active          BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(agent_id, version)
+);

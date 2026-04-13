@@ -12,6 +12,31 @@ pub struct RouterConfig {
     pub circuit_breaker: CircuitBreakerConfig,
     #[serde(default)]
     pub budget: BudgetConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
+    #[serde(default)]
+    pub guardrails: GuardrailsConfig,
+    #[serde(default)]
+    pub mlflow: MlflowConfig,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GuardrailsConfig {
+    #[serde(default)]
+    pub prompt_injection: bool,
+    #[serde(default)]
+    pub secret_scan: bool,
+}
+
+impl Default for GuardrailsConfig {
+    fn default() -> Self {
+        Self {
+            prompt_injection: false,
+            secret_scan: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -103,6 +128,50 @@ impl Default for BudgetConfig {
             default_max_calls: 50,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CacheConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_cache_ttl")]
+    pub ttl_seconds: u64,
+    /// Cosine similarity threshold for semantic cache hits (0.0–1.0).
+    #[serde(default = "default_semantic_threshold")]
+    pub semantic_threshold: f64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ttl_seconds: 86400,
+            semantic_threshold: 0.95,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MlflowConfig {
+    #[serde(default)]
+    pub tracking_uri: Option<String>,
+    #[serde(default)]
+    pub experiment_name: Option<String>,
+    #[serde(default)]
+    pub log_prompts: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TelemetryConfig {
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+}
+
+fn default_cache_ttl() -> u64 {
+    86400
+}
+fn default_semantic_threshold() -> f64 {
+    0.95
 }
 
 fn default_weight() -> u32 {

@@ -173,6 +173,16 @@ impl EventBus {
         let mut channels = self.channels.write().await;
         channels.remove(task_id);
     }
+
+    /// Shut down all channels, dropping all SSE subscribers.
+    pub async fn shutdown(&self) {
+        let mut channels = self.channels.write().await;
+        let count = channels.len();
+        channels.clear();
+        let mut sequences = self.sequences.write().await;
+        sequences.clear();
+        tracing::info!(channels = count, "event bus shut down, all SSE channels closed");
+    }
 }
 
 /// Convenience helper: emit common events.

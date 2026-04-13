@@ -18,40 +18,9 @@ from finit_agent.a2a import (
     TaskState,
     TaskStatus,
 )
-from finit_agent.llm import LLMClient
+from finit_agent.llm import LLMClient, load_prompt_versioned
 
 logger = logging.getLogger(__name__)
-
-SYSTEM_PROMPT = """\
-You are a senior software engineer acting as a task planner. Given a task \
-description, you generate a structured specification for implementation.
-
-You MUST respond with valid JSON (no markdown, no code blocks) in exactly \
-this format:
-
-{
-  "title": "Short title for the task",
-  "description": "Detailed description of what needs to be done",
-  "acceptance_criteria": [
-    "Criterion 1 - specific and testable",
-    "Criterion 2 - specific and testable"
-  ],
-  "test_plan": {
-    "unit_tests": ["TestName1", "TestName2"],
-    "commands": ["test command 1"]
-  },
-  "files_likely_affected": ["file1.go", "file2.go"],
-  "domains": ["domain1"]
-}
-
-Requirements for the specification:
-- Title should be concise but descriptive
-- Description should explain the full scope
-- Acceptance criteria must be specific and verifiable
-- Test plan should include concrete test names and commands
-- Files affected should be realistic guesses based on the task
-- Domains should categorize the work (e.g., "go-backend", "api", "database")
-"""
 
 
 async def handle_task(
@@ -69,16 +38,20 @@ async def handle_task(
 
     if not task_description:
         return A2AResult(
-            status=TaskStatus(state=TaskState.failed, message="No task description provided"),
+            status=TaskStatus.fail("No task description provided"),
             artifacts=[],
         )
 
     logger.info("Generating spec for task %s: %s", task_id, task_description[:100])
 
-    llm = LLMClient(agent_id="planner")
+    # Load versioned prompt (A/B selection from prompt_configs table)
+    system_prompt, prompt_version, prompt_params = await load_prompt_versioned("planner")
+    logger.info("Planner using prompt version=%s for task %s", prompt_version, task_id)
+
+    llm = LLMClient(agent_id="planner", prompt_version=prompt_version)
     try:
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"Create a specification for the following task:\n\n{task_description}"},
         ]
 
@@ -112,7 +85,7 @@ async def handle_task(
     except Exception as exc:
         logger.exception("Failed to generate spec for task %s", task_id)
         return A2AResult(
-            status=TaskStatus(state=TaskState.failed, message=f"Spec generation failed: {exc}"),
+            status=TaskStatus.fail(f"Spec generation failed: {exc}"),
             artifacts=[],
         )
     finally:

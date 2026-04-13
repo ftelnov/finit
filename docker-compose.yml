@@ -21,6 +21,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    stop_grace_period: 30s
     networks:
       - finit-net
 
@@ -48,6 +49,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    stop_grace_period: 30s
     networks:
       - finit-net
 
@@ -72,6 +74,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    stop_grace_period: 30s
     networks:
       - finit-net
 
@@ -98,6 +101,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    stop_grace_period: 30s
     networks:
       - finit-net
 
@@ -121,6 +125,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    stop_grace_period: 30s
     networks:
       - finit-net
 
@@ -144,6 +149,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    stop_grace_period: 30s
     networks:
       - finit-net
 
@@ -224,9 +230,24 @@ services:
       - "9090:9090"
     volumes:
       - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - finit-net
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./config/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9093/-/healthy"]
       interval: 10s
       timeout: 5s
       retries: 5

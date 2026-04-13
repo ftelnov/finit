@@ -30,5 +30,9 @@ mlflow:
   experiment_name: "finit-llm"
   log_prompts: false
 
+cache:
+  enabled: true
+  ttl_seconds: 86400
+
 telemetry:
   otlp_endpoint: "otel-collector:4317"

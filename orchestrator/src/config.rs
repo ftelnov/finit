@@ -19,6 +19,7 @@ pub struct Config {
     pub unhealthy_threshold: i32,
     pub max_events_per_task: i32,
     pub db_max_connections: u32,
+    pub supervisor_model: String,
 }
 
 impl Config {
@@ -79,6 +80,9 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(20),
+            supervisor_model: env::var("SUPERVISOR_MODEL")
+                .or_else(|_| env::var("LLM_MODEL"))
+                .unwrap_or_else(|_| "default".into()),
         }
     }
 }

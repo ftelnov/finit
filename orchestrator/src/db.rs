@@ -515,6 +515,267 @@ pub async fn get_agent_by_name(pool: &PgPool, name: &str) -> Result<Option<Agent
         .await
 }
 
+// ─── Memory models ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct MemoryRule {
+    pub id: i32,
+    pub scope_type: String,
+    pub scope_id: Option<String>,
+    pub content: String,
+    pub author_agent: Option<String>,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct MemoryFact {
+    pub id: i32,
+    pub scope_type: String,
+    pub scope_id: Option<String>,
+    pub content: String,
+    pub tags: Option<Vec<String>>,
+    pub author_agent: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Workspace {
+    pub id: String,
+    pub project_id: String,
+    pub base_image: String,
+    pub dockerfile: Option<String>,
+    pub volume_name: String,
+    pub capabilities: serde_json::Value,
+    pub status: String,
+    pub build_log: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: DateTime<Utc>,
+}
+
+// ─── Memory rule operations ─────────────────────────────────────────────────
+
+pub async fn create_memory_rule(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_id: Option<&str>,
+    content: &str,
+    author_agent: Option<&str>,
+) -> Result<MemoryRule, sqlx::Error> {
+    sqlx::query_as::<_, MemoryRule>(
+        r#"INSERT INTO memory_rules (scope_type, scope_id, content, author_agent)
+           VALUES ($1, $2, $3, $4)
+           RETURNING *"#,
+    )
+    .bind(scope_type)
+    .bind(scope_id)
+    .bind(content)
+    .bind(author_agent)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_memory_rules(
+    pool: &PgPool,
+    scope_type: Option<&str>,
+    scope_id: Option<&str>,
+) -> Result<Vec<MemoryRule>, sqlx::Error> {
+    match (scope_type, scope_id) {
+        (Some(st), Some(si)) => {
+            sqlx::query_as::<_, MemoryRule>(
+                "SELECT * FROM memory_rules WHERE active = true AND scope_type = $1 AND scope_id = $2 ORDER BY created_at",
+            )
+            .bind(st)
+            .bind(si)
+            .fetch_all(pool)
+            .await
+        }
+        (Some(st), None) => {
+            sqlx::query_as::<_, MemoryRule>(
+                "SELECT * FROM memory_rules WHERE active = true AND scope_type = $1 ORDER BY created_at",
+            )
+            .bind(st)
+            .fetch_all(pool)
+            .await
+        }
+        _ => {
+            sqlx::query_as::<_, MemoryRule>(
+                "SELECT * FROM memory_rules WHERE active = true ORDER BY created_at",
+            )
+            .fetch_all(pool)
+            .await
+        }
+    }
+}
+
+pub async fn deactivate_memory_rule(pool: &PgPool, id: i32) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE memory_rules SET active = false, updated_at = NOW() WHERE id = $1 AND active = true",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+// ─── Memory fact operations ─────────────────────────────────────────────────
+
+pub async fn create_memory_fact(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_id: Option<&str>,
+    content: &str,
+    tags: Option<&[String]>,
+    author_agent: Option<&str>,
+) -> Result<MemoryFact, sqlx::Error> {
+    sqlx::query_as::<_, MemoryFact>(
+        r#"INSERT INTO memory_facts (scope_type, scope_id, content, tags, author_agent)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING *"#,
+    )
+    .bind(scope_type)
+    .bind(scope_id)
+    .bind(content)
+    .bind(tags)
+    .bind(author_agent)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_memory_facts(
+    pool: &PgPool,
+    scope_type: Option<&str>,
+    scope_id: Option<&str>,
+) -> Result<Vec<MemoryFact>, sqlx::Error> {
+    match (scope_type, scope_id) {
+        (Some(st), Some(si)) => {
+            sqlx::query_as::<_, MemoryFact>(
+                "SELECT * FROM memory_facts WHERE scope_type = $1 AND scope_id = $2 ORDER BY created_at",
+            )
+            .bind(st)
+            .bind(si)
+            .fetch_all(pool)
+            .await
+        }
+        (Some(st), None) => {
+            sqlx::query_as::<_, MemoryFact>(
+                "SELECT * FROM memory_facts WHERE scope_type = $1 ORDER BY created_at",
+            )
+            .bind(st)
+            .fetch_all(pool)
+            .await
+        }
+        _ => {
+            sqlx::query_as::<_, MemoryFact>(
+                "SELECT * FROM memory_facts ORDER BY created_at",
+            )
+            .fetch_all(pool)
+            .await
+        }
+    }
+}
+
+pub async fn search_memory_facts_by_tags(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_id: Option<&str>,
+    tags: &[String],
+) -> Result<Vec<MemoryFact>, sqlx::Error> {
+    if let Some(si) = scope_id {
+        sqlx::query_as::<_, MemoryFact>(
+            "SELECT * FROM memory_facts WHERE scope_type = $1 AND scope_id = $2 AND tags && $3 ORDER BY created_at",
+        )
+        .bind(scope_type)
+        .bind(si)
+        .bind(tags)
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query_as::<_, MemoryFact>(
+            "SELECT * FROM memory_facts WHERE scope_type = $1 AND tags && $2 ORDER BY created_at",
+        )
+        .bind(scope_type)
+        .bind(tags)
+        .fetch_all(pool)
+        .await
+    }
+}
+
+// ─── Workspace operations ───────────────────────────────────────────────────
+
+pub async fn get_workspace(pool: &PgPool, id: &str) -> Result<Option<Workspace>, sqlx::Error> {
+    sqlx::query_as::<_, Workspace>("SELECT * FROM workspaces WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn list_workspaces(
+    pool: &PgPool,
+    project_id: Option<&str>,
+    status: Option<&str>,
+) -> Result<Vec<Workspace>, sqlx::Error> {
+    match (project_id, status) {
+        (Some(pid), Some(st)) => {
+            sqlx::query_as::<_, Workspace>(
+                "SELECT * FROM workspaces WHERE project_id = $1 AND status = $2 ORDER BY created_at DESC",
+            )
+            .bind(pid)
+            .bind(st)
+            .fetch_all(pool)
+            .await
+        }
+        (Some(pid), None) => {
+            sqlx::query_as::<_, Workspace>(
+                "SELECT * FROM workspaces WHERE project_id = $1 ORDER BY created_at DESC",
+            )
+            .bind(pid)
+            .fetch_all(pool)
+            .await
+        }
+        (None, Some(st)) => {
+            sqlx::query_as::<_, Workspace>(
+                "SELECT * FROM workspaces WHERE status = $1 ORDER BY created_at DESC",
+            )
+            .bind(st)
+            .fetch_all(pool)
+            .await
+        }
+        (None, None) => {
+            sqlx::query_as::<_, Workspace>(
+                "SELECT * FROM workspaces ORDER BY created_at DESC",
+            )
+            .fetch_all(pool)
+            .await
+        }
+    }
+}
+
+pub async fn update_workspace_status(
+    pool: &PgPool,
+    id: &str,
+    status: &str,
+) -> Result<Workspace, sqlx::Error> {
+    sqlx::query_as::<_, Workspace>(
+        "UPDATE workspaces SET status = $2, last_used_at = NOW() WHERE id = $1 RETURNING *",
+    )
+    .bind(id)
+    .bind(status)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn delete_workspace(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE workspaces SET status = 'deleted', last_used_at = NOW() WHERE id = $1 AND status != 'deleted'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 // ─── Health check ────────────────────────────────────────────────────────────
 
 pub async fn check_health(pool: &PgPool) -> Result<bool, sqlx::Error> {

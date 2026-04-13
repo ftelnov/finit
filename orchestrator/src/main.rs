@@ -7,6 +7,7 @@ mod config;
 mod db;
 mod metrics;
 mod supervisor;
+mod supervisor_tools;
 
 use axum::routing::{delete, get, post};
 use axum::Router;
@@ -71,10 +72,14 @@ async fn main() -> anyhow::Result<()> {
     // Build router
     let app = build_router(state);
 
-    // Start server
+    // Start server with graceful shutdown
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     tracing::info!(addr = %config.listen_addr, "listening");
-    axum::serve(listener, app).await?;
+
+    let shutdown_state = state.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_state))
+        .await?;
 
     Ok(())
 }
@@ -99,12 +104,92 @@ fn build_router(state: AppState) -> Router {
         .route("/api/agents", get(api::list_agents))
         .route("/api/agents/:id", get(api::get_agent))
         .route("/api/agents/:id", delete(api::delete_agent))
+        // Memory endpoints
+        .route("/api/memory/rules", post(api::create_memory_rule))
+        .route("/api/memory/rules", get(api::list_memory_rules))
+        .route("/api/memory/rules/:id", delete(api::deactivate_memory_rule))
+        .route("/api/memory/facts", post(api::create_memory_fact))
+        .route("/api/memory/facts", get(api::list_memory_facts))
+        .route("/api/memory/facts/search", post(api::search_memory_facts))
+        // Workspace endpoints
+        .route("/api/workspaces", get(api::list_workspaces))
+        .route("/api/workspaces/:id", get(api::get_workspace))
+        .route("/api/workspaces/:id", delete(api::delete_workspace))
         // System endpoints
         .route("/health", get(api::health_check))
         .route("/metrics", get(metrics::metrics_handler))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
+}
+
+/// Wait for SIGTERM / SIGINT, then perform graceful shutdown:
+/// 1. Stop accepting new tasks
+/// 2. Checkpoint running tasks in PostgreSQL
+/// 3. Emit AG-UI shutdown events to connected clients
+/// 4. Close SSE connections
+/// 5. Close database pool
+async fn shutdown_signal(state: AppState) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for ctrl_c");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("shutdown signal received, starting graceful shutdown");
+
+    // 1. Fetch running tasks before marking them
+    let running_tasks: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM tasks WHERE status IN ('running', 'created')",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    // 2. Mark all running tasks as failed with shutdown reason
+    let result = sqlx::query(
+        "UPDATE tasks SET status = 'failed', error = 'platform_shutdown', updated_at = NOW()
+         WHERE status IN ('running', 'created')",
+    )
+    .execute(&state.pool)
+    .await;
+
+    match result {
+        Ok(r) => tracing::info!(tasks = r.rows_affected(), "checkpointed running tasks"),
+        Err(e) => tracing::error!(error = %e, "failed to checkpoint tasks on shutdown"),
+    }
+
+    // 3. Emit AG-UI RUN_ERROR events to notify connected clients
+    for task_id in &running_tasks {
+        if let Err(e) = state
+            .event_bus
+            .emit_run_error(task_id, "platform_shutdown", None)
+            .await
+        {
+            tracing::warn!(task_id = %task_id, error = %e, "failed to emit shutdown event");
+        }
+    }
+
+    // 4. Close all SSE channels
+    state.event_bus.shutdown().await;
+
+    tracing::info!("graceful shutdown complete");
 }
 
 /// Spawn a background task that periodically checks agent health.

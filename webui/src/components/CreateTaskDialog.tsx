@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { X } from "lucide-react";
 import { useStore } from "../stores/store";
 
@@ -7,6 +7,13 @@ interface CreateTaskDialogProps {
 }
 
 export function CreateTaskDialog({ onClose }: CreateTaskDialogProps) {
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
   const [input, setInput] = useState("");
   const [projectId, setProjectId] = useState("");
   const [loading, setLoading] = useState(false);

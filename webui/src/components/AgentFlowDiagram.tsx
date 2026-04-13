@@ -12,7 +12,7 @@ import {
   Clock,
   User,
 } from "lucide-react";
-import type { Task, AgentName } from "../types";
+import type { Task } from "../types";
 
 interface TaskEventsLike {
   timeline: Array<{ event: { type: string; step?: string; agent_id?: string; status?: string; duration_ms?: number } }>;
@@ -70,6 +70,14 @@ const STEP_CONFIG: Record<
   },
 };
 
+// Maps event step/agent names to pipeline step names
+const AGENT_TO_STEP: Record<string, string> = {
+  planner: "spec",
+  bootstrapper: "bootstrap",
+  worker: "work",
+  reviewer: "review",
+};
+
 function deriveStepStates(
   events: TaskEventsLike | undefined,
   task: Task,
@@ -89,15 +97,17 @@ function deriveStepStates(
 
     if (event.type === "STEP_STARTED") {
       const e = event as { type: string; step: string; agent_id: string };
-      const existing = states.get(e.step);
+      const stepKey = AGENT_TO_STEP[e.step] ?? e.step;
+      const existing = states.get(stepKey);
       if (existing) {
-        states.set(e.step, { ...existing, status: "active", agent: e.agent_id });
+        states.set(stepKey, { ...existing, status: "active", agent: e.agent_id });
       }
     }
 
     if (event.type === "STEP_FINISHED") {
       const e = event as { type: string; step: string; status: string; duration_ms: number };
-      const existing = states.get(e.step);
+      const stepKey = AGENT_TO_STEP[e.step] ?? e.step;
+      const existing = states.get(stepKey);
       if (existing) {
         const status =
           e.status === "completed"
@@ -105,7 +115,7 @@ function deriveStepStates(
             : e.status === "failed" || e.status === "rejected"
               ? "failed"
               : "completed";
-        states.set(e.step, {
+        states.set(stepKey, {
           ...existing,
           status: status as StepState["status"],
           durationMs: e.duration_ms,

@@ -1,6 +1,6 @@
 use prometheus::{
-    register_counter_vec, register_gauge_vec, register_histogram_vec, CounterVec, GaugeVec,
-    HistogramVec,
+    register_counter, register_counter_vec, register_gauge_vec, register_histogram_vec, Counter,
+    CounterVec, GaugeVec, HistogramVec,
 };
 use std::sync::LazyLock;
 
@@ -75,6 +75,43 @@ pub static LLM_PROVIDER_LATENCY_EWMA: LazyLock<GaugeVec> = LazyLock::new(|| {
     .expect("failed to register finit_llm_provider_latency_ewma_seconds")
 });
 
+/// Cache hits
+pub static LLM_CACHE_HITS: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "finit_llm_cache_hits_total",
+        "Total LLM cache hits"
+    )
+    .expect("failed to register finit_llm_cache_hits_total")
+});
+
+/// Cache misses
+pub static LLM_CACHE_MISSES: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "finit_llm_cache_misses_total",
+        "Total LLM cache misses"
+    )
+    .expect("failed to register finit_llm_cache_misses_total")
+});
+
+/// Cache semantic hits (subset of total hits that came from embedding similarity)
+pub static LLM_CACHE_SEMANTIC_HITS: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "finit_llm_cache_semantic_hits_total",
+        "Total LLM cache semantic hits (embedding similarity)"
+    )
+    .expect("failed to register finit_llm_cache_semantic_hits_total")
+});
+
+/// Guardrail-blocked requests
+pub static LLM_GUARDRAIL_BLOCKS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        "finit_llm_guardrail_blocks_total",
+        "Total guardrail-blocked requests",
+        &["violation_type"]
+    )
+    .expect("failed to register finit_llm_guardrail_blocks_total")
+});
+
 /// Initialize all metrics (force lazy registration)
 pub fn init_metrics() {
     LazyLock::force(&LLM_REQUESTS_TOTAL);
@@ -84,4 +121,8 @@ pub fn init_metrics() {
     LazyLock::force(&LLM_ACTIVE_REQUESTS);
     LazyLock::force(&LLM_CIRCUIT_BREAKER_STATE);
     LazyLock::force(&LLM_PROVIDER_LATENCY_EWMA);
+    LazyLock::force(&LLM_CACHE_HITS);
+    LazyLock::force(&LLM_CACHE_MISSES);
+    LazyLock::force(&LLM_CACHE_SEMANTIC_HITS);
+    LazyLock::force(&LLM_GUARDRAIL_BLOCKS);
 }

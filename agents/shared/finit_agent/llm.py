@@ -2,13 +2,23 @@
 
 Calls the LLM Router using the OpenAI-compatible chat completions API.
 Adds X-Task-ID and X-Agent-ID headers for budget tracking and observability.
+
+Supports:
+- Single-shot chat (text / JSON)
+- Multi-turn tool-use loops (agentic)
+- Streaming
+- Prompt version routing (A/B testing via weighted selection)
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 import os
+import random
+import re
+from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
 import httpx
@@ -16,8 +26,135 @@ import httpx
 logger = logging.getLogger(__name__)
 
 DEFAULT_LLM_ROUTER_URL = "http://mock-llm:8000"
-DEFAULT_MODEL = "mock-llm"
+DEFAULT_MODEL = os.environ.get("LLM_MODEL", "mock-llm")
 DEFAULT_TIMEOUT = 120.0
+MAX_TOOL_TURNS = 15
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+_PROMPTS_DIR = Path(os.environ.get("PROMPTS_DIR", "/app/prompts"))
+
+
+@dataclass
+class PromptVersion:
+    """A prompt version with its weight and optional LLM parameters."""
+    version: str
+    weight: int
+    template_path: str
+    parameters: dict[str, Any]
+
+
+# Cache of prompt configs fetched from the database
+_prompt_configs_cache: dict[str, list[PromptVersion]] = {}
+
+
+async def fetch_prompt_configs(agent_id: str) -> list[PromptVersion]:
+    """Fetch active prompt versions from the orchestrator's database.
+
+    Falls back to default v1 if database is unavailable.
+    """
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        return []
+
+    try:
+        # Use asyncpg if available, otherwise fall back
+        import asyncpg  # type: ignore[import-untyped]
+        conn = await asyncpg.connect(db_url)
+        try:
+            rows = await conn.fetch(
+                "SELECT version, weight, template_path, parameters "
+                "FROM prompt_configs WHERE agent_id = $1 AND active = TRUE "
+                "ORDER BY weight DESC",
+                agent_id,
+            )
+            configs = []
+            for row in rows:
+                params = row["parameters"]
+                if isinstance(params, str):
+                    params = json.loads(params)
+                configs.append(PromptVersion(
+                    version=row["version"],
+                    weight=row["weight"],
+                    template_path=row["template_path"],
+                    parameters=params or {},
+                ))
+            return configs
+        finally:
+            await conn.close()
+    except Exception as exc:
+        logger.debug("Could not fetch prompt configs for %s: %s", agent_id, exc)
+        return []
+
+
+def _select_version_weighted(configs: list[PromptVersion]) -> PromptVersion:
+    """Select a prompt version using weighted random sampling."""
+    total = sum(c.weight for c in configs)
+    r = random.randint(1, total)
+    cumulative = 0
+    for config in configs:
+        cumulative += config.weight
+        if r <= cumulative:
+            return config
+    return configs[-1]  # fallback
+
+
+async def load_prompt_versioned(agent: str) -> tuple[str, str, dict[str, Any]]:
+    """Load a system prompt with A/B version routing.
+
+    Returns (prompt_content, version, parameters).
+    Checks prompt_configs table for weighted version selection, falls back to v1.
+    """
+    # Try fetching configs from DB (cached per-agent)
+    if agent not in _prompt_configs_cache:
+        configs = await fetch_prompt_configs(agent)
+        if configs:
+            _prompt_configs_cache[agent] = configs
+
+    configs = _prompt_configs_cache.get(agent)
+    if configs and len(configs) > 0:
+        selected = _select_version_weighted(configs)
+        content = load_prompt(agent, selected.version)
+        if content:
+            logger.info(
+                "Prompt version selected: agent=%s version=%s (weight=%d)",
+                agent, selected.version, selected.weight,
+            )
+            return content, selected.version, selected.parameters
+        # Fall through to default if file doesn't exist
+
+    # Default: v1, no extra parameters
+    return load_prompt(agent, "v1"), "v1", {}
+
+
+def load_prompt(agent: str, version: str = "v1") -> str:
+    """Load a system prompt from file, with fallback to empty string."""
+    path = _PROMPTS_DIR / agent / version / "system.md"
+    if path.exists():
+        return path.read_text().strip()
+    # Try relative to cwd (for local dev)
+    local = Path("prompts") / agent / version / "system.md"
+    if local.exists():
+        return local.read_text().strip()
+    logger.warning("Prompt file not found: %s", path)
+    return ""
+
+
+def _strip_think_tags(content: str) -> str:
+    """Remove <think>...</think> reasoning blocks from model output."""
+    return _THINK_RE.sub("", content).strip()
+
+
+def _extract_json_text(content: str) -> str:
+    """Extract JSON from LLM response, handling <think> tags and code blocks."""
+    text = _strip_think_tags(content)
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    return text
 
 
 class LLMClient:
@@ -28,10 +165,12 @@ class LLMClient:
         agent_id: str,
         router_url: str | None = None,
         default_model: str = DEFAULT_MODEL,
+        prompt_version: str | None = None,
     ) -> None:
         self.agent_id = agent_id
         self.router_url = (router_url or os.environ.get("LLM_ROUTER_URL", DEFAULT_LLM_ROUTER_URL)).rstrip("/")
         self.default_model = default_model
+        self.prompt_version = prompt_version
         self._client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
 
     async def close(self) -> None:
@@ -45,11 +184,13 @@ class LLMClient:
         }
         if task_id:
             headers["X-Task-ID"] = task_id
+        if self.prompt_version:
+            headers["X-Prompt-Version"] = self.prompt_version
         return headers
 
     def _build_payload(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         model: str | None = None,
         stream: bool = False,
         **kwargs: Any,
@@ -59,23 +200,24 @@ class LLMClient:
             "messages": messages,
             "stream": stream,
         }
-        # Forward supported kwargs
-        for key in ("temperature", "max_tokens", "top_p", "stop", "response_format"):
+        for key in ("temperature", "max_tokens", "top_p", "stop",
+                     "response_format", "tools", "tool_choice"):
             if key in kwargs:
                 payload[key] = kwargs[key]
         return payload
 
+    # -----------------------------------------------------------------
+    # Single-shot chat
+    # -----------------------------------------------------------------
+
     async def chat(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         model: str | None = None,
         task_id: str | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Send a non-streaming chat completion request.
-
-        Returns the full response dict (OpenAI format).
-        """
+        """Send a non-streaming chat completion request. Returns full response dict."""
         payload = self._build_payload(messages, model=model, stream=False, **kwargs)
         url = f"{self.router_url}/v1/chat/completions"
         headers = self._headers(task_id=task_id)
@@ -86,15 +228,12 @@ class LLMClient:
         resp.raise_for_status()
         data = resp.json()
 
-        logger.debug(
-            "LLM chat response: tokens=%s",
-            data.get("usage", {}).get("total_tokens", "?"),
-        )
+        logger.debug("LLM chat response: tokens=%s", data.get("usage", {}).get("total_tokens", "?"))
         return data
 
     async def chat_content(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         model: str | None = None,
         task_id: str | None = None,
         **kwargs: Any,
@@ -103,40 +242,106 @@ class LLMClient:
         data = await self.chat(messages, model=model, task_id=task_id, **kwargs)
         choices = data.get("choices", [])
         if choices:
-            return choices[0].get("message", {}).get("content", "")
+            return choices[0].get("message", {}).get("content", "") or ""
         return ""
 
     async def chat_json(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         model: str | None = None,
         task_id: str | None = None,
         **kwargs: Any,
     ) -> Any:
-        """Send a chat request and parse the response content as JSON."""
+        """Send a chat request and parse the response content as JSON.
+
+        Automatically requests json_object response format.
+        """
+        kwargs.setdefault("response_format", {"type": "json_object"})
         content = await self.chat_content(messages, model=model, task_id=task_id, **kwargs)
-        # Try to extract JSON from the response (handle markdown code blocks)
-        text = content.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            # Remove first and last lines (code block markers)
-            lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            text = "\n".join(lines)
+        text = _extract_json_text(content)
         return json.loads(text)
+
+    # -----------------------------------------------------------------
+    # Tool-use agentic loop
+    # -----------------------------------------------------------------
+
+    async def chat_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        execute_tool: Any,  # async (name, args) -> str
+        model: str | None = None,
+        task_id: str | None = None,
+        max_turns: int = MAX_TOOL_TURNS,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Multi-turn tool-use loop.
+
+        Calls the LLM with tools, executes any tool_calls via `execute_tool`,
+        feeds results back, and repeats until the model stops calling tools
+        or max_turns is reached.
+
+        Args:
+            messages: Initial message history (mutated in place).
+            tools: OpenAI-format tool definitions.
+            execute_tool: Async callable(name: str, args: dict) -> str.
+            max_turns: Safety limit on LLM round-trips.
+
+        Returns:
+            The final assistant message dict.
+        """
+        for turn in range(max_turns):
+            data = await self.chat(
+                messages, model=model, task_id=task_id,
+                tools=tools, **kwargs,
+            )
+            msg = data["choices"][0]["message"]
+
+            # Normalize: ensure content key exists
+            if "content" not in msg:
+                msg["content"] = None
+
+            messages.append(msg)
+
+            tool_calls = msg.get("tool_calls")
+            if not tool_calls:
+                # Model is done — no more tool calls
+                logger.info("Tool loop finished after %d turns", turn + 1)
+                return msg
+
+            # Execute each tool call and append results
+            for tc in tool_calls:
+                fn_name = tc["function"]["name"]
+                fn_args = json.loads(tc["function"]["arguments"])
+                logger.info("Tool call [turn %d]: %s(%s)", turn, fn_name, list(fn_args.keys()))
+
+                try:
+                    result = await execute_tool(fn_name, fn_args)
+                except Exception as exc:
+                    result = f"ERROR: {exc}"
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": str(result),
+                })
+
+        logger.warning("Tool loop hit max_turns=%d", max_turns)
+        # Return the last assistant message
+        return msg
+
+    # -----------------------------------------------------------------
+    # Streaming
+    # -----------------------------------------------------------------
 
     async def chat_stream(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         model: str | None = None,
         task_id: str | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Send a streaming chat completion request.
-
-        Yields parsed SSE data chunks (OpenAI streaming format).
-        """
+        """Send a streaming chat completion request. Yields parsed SSE chunks."""
         payload = self._build_payload(messages, model=model, stream=True, **kwargs)
         url = f"{self.router_url}/v1/chat/completions"
         headers = self._headers(task_id=task_id)

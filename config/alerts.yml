@@ -1,0 +1,142 @@
+groups:
+  - name: finit-slo
+    interval: 15s
+    rules:
+      # SLO-1: Workspace build time p95 < 60s
+      - alert: WorkspaceBuildSlow
+        expr: histogram_quantile(0.95, rate(finit_workspace_build_duration_seconds_bucket[15m])) > 90
+        for: 5m
+        labels:
+          severity: warning
+          slo: SLO-1
+        annotations:
+          summary: "Workspace build p95 > 90s"
+
+      # SLO-4: LLM Router availability > 99.5%
+      - alert: LLMRouterHighErrorRate
+        expr: |
+          rate(finit_llm_requests_total{status=~"5.."}[5m])
+          / rate(finit_llm_requests_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          slo: SLO-4
+        annotations:
+          summary: "LLM Router error rate > 5%"
+
+      # SLO-6: Provider failover < 1s
+      - alert: ProviderFailoverSlow
+        expr: finit_llm_circuit_breaker_state > 0 and ON() increase(finit_llm_requests_total{status="503"}[1m]) > 0
+        for: 3s
+        labels:
+          severity: critical
+          slo: SLO-6
+        annotations:
+          summary: "Provider failover taking too long"
+
+      # SLO-8: Agent health uptime 99.9%
+      - alert: AgentUnhealthy
+        expr: finit_agent_health == 0
+        for: 60s
+        labels:
+          severity: critical
+          slo: SLO-8
+        annotations:
+          summary: "Agent {{ $labels.agent }} unhealthy > 60s"
+
+  - name: finit-llm-router
+    interval: 15s
+    rules:
+      - alert: LLMProviderDown
+        expr: finit_llm_circuit_breaker_state == 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "LLM provider {{ $labels.provider }} circuit breaker open"
+          description: "Provider {{ $labels.provider }} has been unhealthy for 30s. Failover active."
+
+      - alert: LLMAllProvidersDown
+        expr: sum(finit_llm_provider_health) == 0
+        for: 10s
+        labels:
+          severity: critical
+        annotations:
+          summary: "All LLM providers are down — tasks will be paused"
+
+      - alert: LLMHighTTFT
+        expr: histogram_quantile(0.95, rate(finit_llm_ttft_seconds_bucket[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM TTFT p95 > 10s for {{ $labels.provider }}/{{ $labels.model }}"
+
+      - alert: SecretLeakageBlocked
+        expr: increase(finit_guardrail_blocks_total{type="secret"}[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Secret leakage attempt blocked — review audit log"
+
+      - alert: PromptInjectionBlocked
+        expr: increase(finit_guardrail_blocks_total{type="injection"}[1h]) > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: "Multiple prompt injection attempts blocked ({{ $value }} in 1h)"
+
+  - name: finit-pipeline
+    interval: 15s
+    rules:
+      - alert: AgentHighLatency
+        expr: histogram_quantile(0.95, rate(finit_agent_duration_seconds_bucket[10m])) > 120
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agent {{ $labels.agent }} p95 latency > 120s"
+
+      - alert: TaskBudgetNearLimit
+        expr: finit_task_budget_utilization > 0.9
+        labels:
+          severity: warning
+        annotations:
+          summary: "Task budget utilization > 90% — approaching limit"
+
+      - alert: HighEscalationRate
+        expr: |
+          rate(finit_task_total{status="escalated"}[1h])
+          / rate(finit_task_total[1h]) > 0.3
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Task escalation rate > 30% over last hour"
+
+  - name: finit-infrastructure
+    interval: 15s
+    rules:
+      - alert: ContainerHighCPU
+        expr: rate(container_cpu_usage_seconds_total{name=~"finit.*"}[5m]) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.name }} CPU usage > 90% for 10m"
+
+      - alert: ContainerHighMemory
+        expr: container_memory_usage_bytes{name=~"finit.*"} / container_spec_memory_limit_bytes{name=~"finit.*"} > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.name }} RAM usage > 90%"
+
+      - alert: PostgreSQLDown
+        expr: pg_up == 0
+        for: 10s
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL is down — all services affected"

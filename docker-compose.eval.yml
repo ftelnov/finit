@@ -1,0 +1,208 @@
+# Eval stack: all services on host network (sglang LLM is on VPN/tun0)
+services:
+  # === Platform layer ===
+  llm-router:
+    build:
+      context: .
+      dockerfile: llm-router/Dockerfile
+      network: host
+    network_mode: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgres://finit:${PG_PASSWORD}@127.0.0.1:5432/finit
+      - JWT_SECRET=${JWT_SECRET}
+      - MLFLOW_TRACKING_URI=http://127.0.0.1:5000
+      - CONFIG_PATH=/etc/finit/router.yaml
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
+      - OTEL_SERVICE_NAME=finit-llm-router
+    volumes:
+      - ./config/router-eval.yaml:/etc/finit/router.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    stop_grace_period: 30s
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+      network: host
+    network_mode: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgres://finit:${PG_PASSWORD}@127.0.0.1:5432/finit
+      - JWT_SECRET=${JWT_SECRET}
+      - LLM_ROUTER_URL=http://127.0.0.1:8081
+      - SUPERVISOR_MODEL=/opt/MiniMaxAI/MiniMax-M2.7
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
+      - OTEL_SERVICE_NAME=finit-orchestrator
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    stop_grace_period: 30s
+
+  # === Agents (through the router) ===
+  planner:
+    build:
+      context: .
+      dockerfile: agents/planner/Dockerfile
+      network: host
+    network_mode: host
+    environment:
+      - AGENT_TYPE=planner
+      - LLM_ROUTER_URL=http://127.0.0.1:8081
+      - LLM_MODEL=/opt/MiniMaxAI/MiniMax-M2.7
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
+      - OTEL_SERVICE_NAME=finit-planner
+    depends_on:
+      llm-router:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  bootstrapper:
+    build:
+      context: .
+      dockerfile: agents/bootstrapper/Dockerfile
+      network: host
+    network_mode: host
+    environment:
+      - AGENT_TYPE=bootstrapper
+      - LLM_ROUTER_URL=http://127.0.0.1:8081
+      - LLM_MODEL=/opt/MiniMaxAI/MiniMax-M2.7
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
+      - OTEL_SERVICE_NAME=finit-bootstrapper
+    depends_on:
+      llm-router:
+        condition: service_healthy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - workspace-volumes:/var/lib/finit/workspaces
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  worker:
+    build:
+      context: .
+      dockerfile: agents/worker/Dockerfile
+      network: host
+    network_mode: host
+    environment:
+      - AGENT_TYPE=worker
+      - LLM_ROUTER_URL=http://127.0.0.1:8081
+      - LLM_MODEL=/opt/MiniMaxAI/MiniMax-M2.7
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
+      - OTEL_SERVICE_NAME=finit-worker
+    depends_on:
+      llm-router:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9002/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    stop_grace_period: 30s
+
+  reviewer:
+    build:
+      context: .
+      dockerfile: agents/reviewer/Dockerfile
+      network: host
+    network_mode: host
+    environment:
+      - AGENT_TYPE=reviewer
+      - LLM_ROUTER_URL=http://127.0.0.1:8081
+      - LLM_MODEL=/opt/MiniMaxAI/MiniMax-M2.7
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
+      - OTEL_SERVICE_NAME=finit-reviewer
+    depends_on:
+      llm-router:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9003/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # === Data stores ===
+  postgres:
+    image: pgvector/pgvector:pg16
+    network_mode: host
+    environment:
+      - POSTGRES_DB=finit
+      - POSTGRES_USER=finit
+      - POSTGRES_PASSWORD=${PG_PASSWORD}
+    volumes:
+      - pg-data-eval:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finit"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # === Observability (minimal) ===
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    network_mode: host
+    volumes:
+      - ./config/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:13133/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    network_mode: host
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:////mlflow/mlflow.db --default-artifact-root /mlflow/artifacts
+    volumes:
+      - mlflow-data-eval:/mlflow
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # === External services for eval scenarios ===
+  opensearch:
+    image: opensearchproject/opensearch:2.18.0
+    network_mode: host
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - OPENSEARCH_JAVA_OPTS=-Xms256m -Xmx256m
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=F1nitEval_2026!
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://127.0.0.1:9200/_cluster/health | grep -q '\"status\":\"green\\|yellow\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  pg-data-eval:
+  mlflow-data-eval:
+  workspace-volumes:

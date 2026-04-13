@@ -97,7 +97,7 @@ impl Metrics {
                 "finit_supervisor_iterations_total",
                 "Total supervisor loop iterations",
             ),
-            &["task_id", "action"],
+            &["action"],
         )
         .expect("metric creation failed");
 

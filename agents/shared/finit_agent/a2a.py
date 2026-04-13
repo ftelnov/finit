@@ -5,9 +5,12 @@ Implements JSON-RPC 2.0 over HTTP with agent card discovery and health checks.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from enum import Enum
 from typing import Any, Callable, Awaitable
 
@@ -62,7 +65,15 @@ class Message(BaseModel):
 
 class TaskStatus(BaseModel):
     state: TaskState = TaskState.completed
-    message: str | None = None
+    message: Message | None = None
+
+    @classmethod
+    def fail(cls, msg: str) -> "TaskStatus":
+        """Create a failed status with a text message."""
+        return cls(
+            state=TaskState.failed,
+            message=Message(role="agent", parts=[MessagePart(type="text", text=msg)]),
+        )
 
 
 class Artifact(BaseModel):
@@ -130,6 +141,11 @@ def _jsonrpc_result(req_id: str | int | None, result: Any) -> dict:
 # ---------------------------------------------------------------------------
 
 _start_time: float = 0.0
+_active_tasks: int = 0
+_shutting_down: bool = False
+
+# Grace period for in-flight tasks during shutdown (seconds)
+_SHUTDOWN_GRACE_PERIOD = 25.0
 
 
 def create_a2a_app(agent_card: AgentCard, handler: TaskHandler) -> FastAPI:
@@ -140,7 +156,40 @@ def create_a2a_app(agent_card: AgentCard, handler: TaskHandler) -> FastAPI:
         handler: Async function called for tasks/send.
                  Signature: async def handler(task_id, message, metadata) -> A2AResult
     """
-    app = FastAPI(title=f"Finit Agent - {agent_card.name}", version=agent_card.version)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        global _shutting_down
+        logger.info("Agent %s started (pid=%d)", agent_card.name, os.getpid())
+        yield
+
+        # Graceful shutdown sequence
+        _shutting_down = True
+        logger.info("Agent %s shutting down...", agent_card.name)
+
+        # Wait for active tasks to complete their current LLM call
+        if _active_tasks > 0:
+            logger.info(
+                "Waiting for %d active task(s) to finish (grace=%ds)...",
+                _active_tasks, int(_SHUTDOWN_GRACE_PERIOD),
+            )
+            deadline = time.time() + _SHUTDOWN_GRACE_PERIOD
+            while _active_tasks > 0 and time.time() < deadline:
+                await asyncio.sleep(0.5)
+
+            if _active_tasks > 0:
+                logger.warning(
+                    "Shutdown grace period expired with %d task(s) still active",
+                    _active_tasks,
+                )
+
+        logger.info("Agent %s shutdown complete", agent_card.name)
+
+    app = FastAPI(
+        title=f"Finit Agent - {agent_card.name}",
+        version=agent_card.version,
+        lifespan=lifespan,
+    )
     card_dict = agent_card.model_dump()
 
     global _start_time
@@ -157,10 +206,12 @@ def create_a2a_app(agent_card: AgentCard, handler: TaskHandler) -> FastAPI:
     @app.get("/health")
     async def health() -> dict:
         uptime = time.time() - _start_time
+        status = "draining" if _shutting_down else "healthy"
         return {
-            "status": "healthy",
+            "status": status,
             "agent": agent_card.name,
             "uptime_seconds": round(uptime, 2),
+            "active_tasks": _active_tasks,
         }
 
     # -- JSON-RPC 2.0 dispatcher ----------------------------------------------
@@ -208,6 +259,13 @@ async def _handle_tasks_send(
     handler: TaskHandler,
 ) -> JSONResponse:
     """Handle tasks/send: delegate to the agent handler and return result."""
+    # Reject new tasks during shutdown
+    if _shutting_down:
+        return JSONResponse(
+            _jsonrpc_error(req_id, INTERNAL_ERROR, "Agent is shutting down, not accepting new tasks"),
+            status_code=200,
+        )
+
     task_id = params.get("id", str(uuid.uuid4()))
     raw_message = params.get("message", {})
     metadata = params.get("metadata", {})
@@ -218,6 +276,8 @@ async def _handle_tasks_send(
     except Exception:
         message = Message(role="user", parts=[MessagePart(type="text", text=str(raw_message))])
 
+    global _active_tasks
+    _active_tasks += 1
     try:
         logger.info("tasks/send task_id=%s", task_id)
         result = await handler(task_id, message, metadata)
@@ -240,6 +300,8 @@ async def _handle_tasks_send(
             }),
             status_code=200,
         )
+    finally:
+        _active_tasks -= 1
 
 
 async def _handle_tasks_get(req_id: str | int | None, params: dict[str, Any]) -> JSONResponse:
@@ -261,7 +323,7 @@ async def _handle_tasks_cancel(req_id: str | int | None, params: dict[str, Any])
     return JSONResponse(
         _jsonrpc_result(req_id, {
             "id": task_id,
-            "status": {"state": "failed", "message": "cancelled"},
+            "status": {"state": "completed", "message": "cancelled"},
             "artifacts": [],
         }),
         status_code=200,

@@ -3,6 +3,7 @@ RUN apt-get update && apt-get install -y cmake protobuf-compiler && rm -rf /var/
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY orchestrator/ orchestrator/
+COPY prompts/ prompts/
 COPY llm-router/Cargo.toml llm-router/Cargo.toml
 RUN mkdir -p llm-router/src && echo "fn main() {}" > llm-router/src/main.rs
 RUN cargo build --release --package finit-orchestrator

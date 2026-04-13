@@ -10,7 +10,7 @@ import {
   Database,
   Zap,
 } from "lucide-react";
-import type { TimelineEntry, AgUiEvent, AgentName } from "../types";
+import type { TimelineEntry, AgUiEvent } from "../types";
 import { useEffect, useRef } from "react";
 
 interface AgentTimelineProps {
@@ -73,21 +73,33 @@ function getEventColor(event: AgUiEvent): string {
   }
 }
 
+const AGENT_LABELS: Record<string, string> = {
+  planner: "Planner",
+  bootstrapper: "Bootstrapper",
+  worker: "Worker",
+  reviewer: "Reviewer",
+};
+
 function getEventSummary(event: AgUiEvent): string {
   switch (event.type) {
     case "RUN_STARTED":
       return "Run started";
     case "STEP_STARTED": {
       const e = event as { step: string; agent_id: string };
-      return `${e.agent_id} started (${e.step})`;
+      const name = AGENT_LABELS[e.step] ?? e.step;
+      return `${name} started`;
     }
     case "STEP_FINISHED": {
       const e = event as { step: string; status: string; duration_ms: number };
-      const dur =
-        e.duration_ms < 1000
-          ? `${e.duration_ms}ms`
-          : `${(e.duration_ms / 1000).toFixed(1)}s`;
-      return `${e.step} ${e.status} (${dur})`;
+      const name = AGENT_LABELS[e.step] ?? e.step;
+      if (e.duration_ms > 0) {
+        const dur =
+          e.duration_ms < 1000
+            ? `${e.duration_ms}ms`
+            : `${(e.duration_ms / 1000).toFixed(1)}s`;
+        return `${name} ${e.status} (${dur})`;
+      }
+      return `${name} ${e.status}`;
     }
     case "RUN_AWAITING_INPUT": {
       const e = event as { input_type: string; question?: string };
@@ -178,7 +190,7 @@ export function AgentTimeline({ entries, streamingText }: AgentTimelineProps) {
                     </span>
                   </div>
                   <div className="text-[10px] text-zinc-600 mt-0.5">
-                    seq:{entry.seq}
+                    {entry.timestamp.toLocaleTimeString()}
                   </div>
                 </div>
               </div>

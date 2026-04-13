@@ -19,47 +19,9 @@ from finit_agent.a2a import (
     TaskState,
     TaskStatus,
 )
-from finit_agent.llm import LLMClient
+from finit_agent.llm import LLMClient, load_prompt_versioned
 
 logger = logging.getLogger(__name__)
-
-SYSTEM_PROMPT = """\
-You are a senior software engineer acting as a code reviewer. Given a task \
-specification and implementation artifacts, you evaluate whether the \
-implementation satisfies the specification.
-
-You MUST respond with valid JSON (no markdown, no code blocks) in exactly \
-this format:
-
-{
-  "verdict": "PASS" | "FAIL",
-  "findings": [
-    {
-      "severity": "error" | "warning" | "info",
-      "file": "<file_path or empty>",
-      "line": <line_number or null>,
-      "message": "Description of the finding",
-      "evidence": "Relevant evidence (test output, code snippet, etc.)"
-    }
-  ],
-  "summary": "Overall assessment of the implementation",
-  "criteria_met": [
-    {
-      "criterion": "Text of the acceptance criterion",
-      "met": true | false,
-      "evidence": "How it was verified"
-    }
-  ]
-}
-
-Review guidelines:
-- Evaluate ONLY against the acceptance criteria in the spec
-- Every acceptance criterion must be explicitly checked
-- Verdict is PASS only if ALL criteria are met
-- Findings with severity "error" cause FAIL
-- Provide concrete evidence for each finding
-- Be thorough but fair - do not invent issues
-"""
 
 
 async def handle_task(
@@ -77,16 +39,20 @@ async def handle_task(
 
     if not payload_text:
         return A2AResult(
-            status=TaskStatus(state=TaskState.failed, message="No payload provided"),
+            status=TaskStatus.fail("No payload provided"),
             artifacts=[],
         )
 
     logger.info("Reviewing artifacts for task %s", task_id)
 
-    llm = LLMClient(agent_id="reviewer")
+    # Load versioned prompt (A/B selection from prompt_configs table)
+    system_prompt, prompt_version, prompt_params = await load_prompt_versioned("reviewer")
+    logger.info("Reviewer using prompt version=%s for task %s", prompt_version, task_id)
+
+    llm = LLMClient(agent_id="reviewer", prompt_version=prompt_version)
     try:
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": (
@@ -131,7 +97,7 @@ async def handle_task(
     except Exception as exc:
         logger.exception("Failed to review artifacts for task %s", task_id)
         return A2AResult(
-            status=TaskStatus(state=TaskState.failed, message=f"Review failed: {exc}"),
+            status=TaskStatus.fail(f"Review failed: {exc}"),
             artifacts=[],
         )
     finally:

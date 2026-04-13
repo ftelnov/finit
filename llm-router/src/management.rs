@@ -9,9 +9,9 @@ use std::sync::Arc;
 /// Handle GET /health
 pub async fn handle_health(session: &mut Session, pool: &ProviderPool) -> Result<()> {
     let has_healthy = pool.has_healthy_provider();
-    let status = if has_healthy { 200 } else { 503 };
+    let status = 200; // Router is healthy even if providers are down
     let body = json!({
-        "status": if has_healthy { "ok" } else { "no healthy providers" },
+        "status": if has_healthy { "ok" } else { "degraded" },
         "providers_total": pool.providers().len(),
         "providers_healthy": pool.providers().iter().filter(|p| {
             p.healthy.load(std::sync::atomic::Ordering::Relaxed)
