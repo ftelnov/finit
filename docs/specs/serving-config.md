@@ -388,6 +388,247 @@ loadtest:
 | Grafana | 3001 | Dashboards |
 | MLFlow | 5000 | LLM tracing |
 
+## CI/CD Pipeline
+
+### Стадии
+
+Платформа использует Docker Compose для сборки и деплоя. CI/CD pipeline описывает полный цикл от коммита до деплоя.
+
+```
+┌─────────┐    ┌──────────┐    ┌───────────┐    ┌──────────────┐    ┌────────┐
+│  Lint   │───>│  Build   │───>│   Test    │───>│  Integration │───>│ Deploy │
+│ & Check │    │  Images  │    │   Unit    │    │    Tests     │    │        │
+└─────────┘    └──────────┘    └───────────┘    └──────────────┘    └────────┘
+```
+
+### Stage 1: Lint & Check
+
+```makefile
+lint:
+	# Rust (Orchestrator, LLM Router)
+	cd orchestrator && cargo clippy --all-targets -- -D warnings
+	cd llm-router && cargo clippy --all-targets -- -D warnings
+	cd orchestrator && cargo fmt --check
+	cd llm-router && cargo fmt --check
+
+	# Python (Agents)
+	cd agents && ruff check .
+	cd agents && ruff format --check .
+	cd agents && mypy --strict .
+
+	# TypeScript (WebUI)
+	cd webui && npm run lint
+	cd webui && npm run typecheck
+```
+
+### Stage 2: Build Images
+
+```makefile
+build:
+	docker compose build --parallel
+```
+
+Docker layer caching: multi-stage builds с разделением dependency install и source build. При неизменных `Cargo.lock` / `requirements.txt` / `package-lock.json` слой зависимостей берётся из кэша.
+
+```dockerfile
+# Пример: Rust service
+FROM rust:1.78-slim AS deps
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main(){}" > src/main.rs && cargo build --release
+# ↑ Этот слой кэшируется при неизменном Cargo.lock
+
+FROM deps AS build
+COPY src/ src/
+RUN cargo build --release
+# ↑ Пересобирается только при изменении src/
+
+FROM debian:bookworm-slim
+COPY --from=build /app/target/release/service /usr/local/bin/
+```
+
+### Stage 3: Unit Tests
+
+```makefile
+test-unit:
+	# Rust
+	cd orchestrator && cargo test
+	cd llm-router && cargo test
+
+	# Python
+	cd agents && pytest tests/unit/ -v --tb=short
+
+	# TypeScript
+	cd webui && npm test
+```
+
+### Stage 4: Integration Tests
+
+```makefile
+test-integration:
+	docker compose -f docker-compose.yml -f docker-compose.test.yml up --build --abort-on-container-exit e2e-tests
+```
+
+`docker-compose.test.yml` поднимает полный стек с Mock LLM и запускает end-to-end сценарии:
+
+| Сценарий | Описание | Проверяет |
+|---|---|---|
+| **Happy path** | Задача → spec → workspace → code → review → PASS | Полный pipeline |
+| **Review iteration** | FAIL → feedback → re-work → PASS | Итеративный цикл |
+| **Input required** | Worker → input_required → Bootstrapper → resume | Динамическая маршрутизация |
+| **Budget exhaustion** | Задача с малым бюджетом → escalation | Контроль бюджета |
+| **Provider failover** | Остановка primary provider → failover | Circuit breaker |
+| **Guardrail block** | Prompt injection → 403 | Guardrails |
+
+### Stage 5: Deploy
+
+```makefile
+deploy:
+	docker compose pull
+	docker compose up --build -d --remove-orphans
+	# Ожидание health checks
+	docker compose exec orchestrator wget -q --spider http://localhost:8080/health
+	docker compose exec llm-router wget -q --spider http://localhost:8081/health
+```
+
+### Rollback
+
+```makefile
+rollback:
+	docker compose down
+	git checkout HEAD~1 -- docker-compose.yml
+	docker compose up --build -d
+```
+
+При ошибке деплоя: `docker compose down` → откат на предыдущий коммит → `docker compose up`.
+
+---
+
+## Graceful Shutdown Sequence
+
+Последовательность корректного завершения работы платформы. Цель: не потерять in-flight запросы и состояние.
+
+### Общий порядок остановки
+
+```
+1. Frontend (WebUI)           — перестаёт принимать новые сессии
+2. Orchestrator               — drain: завершает текущие задачи или checkpoints
+3. Agents (Worker, Reviewer)  — завершают текущие LLM-вызовы и tool executions
+4. Agents (Planner, Bootstrapper) — завершают текущие операции
+5. LLM Router                 — drain: завершает in-flight LLM requests
+6. Observability (OTel, Prometheus, Grafana, MLFlow) — flush буферов
+7. PostgreSQL                 — последним, после flush всех клиентов
+```
+
+### Shutdown Sequence per-сервис
+
+#### Orchestrator
+
+```
+SIGTERM received
+    ↓
+1. Readiness probe → unhealthy (перестаёт принимать новые задачи)
+    ↓
+2. Для каждой running task:
+   a. Отправить cancel текущему агенту (A2A tasks/cancel)
+   b. Сохранить checkpoint в PostgreSQL:
+      - Текущая фаза (spec/bootstrap/work/review)
+      - Итерация
+      - Потраченный бюджет
+      - Промежуточные артефакты
+   c. Отправить AG-UI событие: RUN_ERROR { reason: "platform_shutdown" }
+    ↓
+3. Закрыть SSE-подключения к WebUI
+    ↓
+4. Закрыть пул соединений PostgreSQL (sqlx pool shutdown)
+    ↓
+5. Flush OTel spans (force flush)
+    ↓
+6. Exit 0
+```
+
+**Таймаут:** 30 секунд. Если задачи не завершились — force kill с сохранением состояния.
+
+#### LLM Router
+
+```
+SIGTERM received
+    ↓
+1. Readiness probe → unhealthy (перестаёт принимать новые запросы)
+    ↓
+2. Ожидание завершения in-flight LLM requests:
+   a. Не прерывать streaming responses
+   b. Дождаться завершения или timeout (30s)
+    ↓
+3. Flush метрик в OTel Collector
+    ↓
+4. Flush MLFlow pending logs
+    ↓
+5. Закрыть пул соединений PostgreSQL
+    ↓
+6. Exit 0
+```
+
+#### Agents (Worker, Reviewer, Planner, Bootstrapper)
+
+```
+SIGTERM received
+    ↓
+1. Readiness probe → unhealthy
+    ↓
+2. Если текущая задача в работе:
+   a. Завершить текущий LLM-вызов (дождаться ответа)
+   b. Сохранить промежуточный результат через A2A status update
+   c. Не начинать новые tool calls
+    ↓
+3. Для Bootstrapper: не начинать новые docker build
+    ↓
+4. Flush OTel spans
+    ↓
+5. Exit 0
+```
+
+#### Docker Compose stop
+
+```makefile
+# Graceful shutdown всей платформы
+stop:
+	# Порядок остановки: frontend → core → agents → infra → data
+	docker compose stop webui                                    # 1. Frontend
+	docker compose stop orchestrator                             # 2. Orchestrator (30s grace)
+	docker compose stop worker reviewer planner bootstrapper     # 3. Agents (30s grace)
+	docker compose stop llm-router                               # 4. Router (30s grace)
+	docker compose stop otel-collector prometheus grafana mlflow  # 5. Observability
+	docker compose stop postgres                                 # 6. Data store (last)
+```
+
+Docker Compose `stop_grace_period` в конфигурации каждого сервиса:
+
+```yaml
+services:
+  orchestrator:
+    stop_grace_period: 30s
+  llm-router:
+    stop_grace_period: 30s
+  worker:
+    stop_grace_period: 30s
+  # ... остальные: 10s (default)
+```
+
+### Восстановление после аварийной остановки
+
+При неожиданном завершении (kill -9, power loss):
+
+| Компонент | Состояние | Восстановление |
+|---|---|---|
+| PostgreSQL | WAL recovery | Автоматическое при старте |
+| Tasks (running) | Статус остался `running` | При старте: пометить как `failed` с `error: "unexpected_shutdown"`, уведомить пользователя |
+| Workspaces | Docker volumes persistent | Доступны после restart |
+| Metrics | Частичная потеря (in-memory buffer) | OTel batch — потеря ~5s метрик |
+| MLFlow | Частичная потеря (unbatched logs) | Приемлемо для аналитики |
+
+---
+
 ## Системные требования
 
 | Ресурс | Minimum | Recommended |

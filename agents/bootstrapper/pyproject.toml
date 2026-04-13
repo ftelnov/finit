@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finit-bootstrapper"
+version = "0.1.0"
+description = "Finit Bootstrapper agent - analyzes specs and reports workspace capabilities"
+requires-python = ">=3.12"
+dependencies = [
+    "finit-agent",
+    "fastapi[standard]>=0.115.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0",
+    "uvicorn>=0.30.0",
+    "opentelemetry-api>=1.25.0",
+    "opentelemetry-sdk>=1.25.0",
+    "opentelemetry-exporter-otlp>=1.25.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["bootstrapper*"]

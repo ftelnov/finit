@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finit-mock-llm"
+version = "0.1.0"
+description = "Mock LLM server for Finit platform testing (OpenAI-compatible)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]>=0.115.0",
+    "uvicorn>=0.30.0",
+    "pydantic>=2.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["mock_llm*"]
